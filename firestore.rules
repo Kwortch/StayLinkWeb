@@ -1,0 +1,43 @@
+rules_version = '2';
+
+// Mirrors the ADMIN_EMAILS list in index.html. Keep the two in sync —
+// the array in the app only hides/shows UI, THIS is what actually
+// enforces who can write to rooms/reservations as staff.
+function isAdminEmail() {
+  return request.auth != null &&
+    request.auth.token.email in [
+      "admin@staylink.com"
+    ];
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Room status (Available / Occupied / Cleaning).
+    // Anyone (including signed-out guests browsing) can read live availability.
+    // Only admin accounts can change it.
+    match /rooms/{roomId} {
+      allow read: if true;
+      allow write: if isAdminEmail();
+    }
+
+    // Reservations.
+    // - A signed-in guest can create a reservation for themselves only
+    //   (guestUid must match their own uid).
+    // - A guest can read/update (e.g. cancel) only their own reservations.
+    // - An admin can read and update any reservation.
+    // - Nobody can delete a reservation (cancel = status update, keeps a record).
+    match /reservations/{resId} {
+      allow create: if request.auth != null
+                    && request.resource.data.guestUid == request.auth.uid;
+
+      allow read: if request.auth != null &&
+                  (resource.data.guestUid == request.auth.uid || isAdminEmail());
+
+      allow update: if request.auth != null &&
+                    (resource.data.guestUid == request.auth.uid || isAdminEmail());
+
+      allow delete: if false;
+    }
+  }
+}

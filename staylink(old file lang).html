@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>StayLink — Hotels &amp; Resorts</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400&family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: {
+          display: ["'Playfair Display'", "serif"],
+          sans: ["'Outfit'", "sans-serif"],
+        },
+        colors: {
+          surface: "#0B0B09",
+          card: "#171612",
+          card2: "#1E1C16",
+          gold: "#C8922A",
+          "gold-light": "#E8B84B",
+          cream: "#EDE8DC",
+          dim: "#9B9488",
+        }
+      }
+    }
+  }
+</script>
+<style>
+  body { background-color:#0B0B09; color:#EDE8DC; font-family:'Outfit',sans-serif; }
+  h1,h2,h3,h4,.font-display { font-family:'Playfair Display',serif; }
+  * { scrollbar-width:none; -ms-overflow-style:none; }
+  *::-webkit-scrollbar { display:none; }
+  input[type="date"] { color-scheme: dark; }
+  .line-clamp-2 { display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .tabular-nums { font-variant-numeric: tabular-nums; }
+  .view { display:none; }
+  .view.active { display:block; }
+  .fade-in { animation: fadeIn .25s ease; }
+  @keyframes fadeIn { from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:translateY(0);} }
+  .room-card { transition: border-color .3s, box-shadow .3s; }
+  .room-card:hover { border-color: rgba(200,146,42,0.35); box-shadow: 0 20px 40px rgba(0,0,0,0.4); }
+  .room-card img { transition: transform .7s; }
+  .room-card:hover img { transform: scale(1.05); }
+  .toast { position:fixed; top:5rem; left:50%; transform:translateX(-50%); z-index:60;
+    background:#C8922A; color:#0B0B09; box-shadow:0 8px 32px rgba(200,146,42,0.4); }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- ── TopNav ─────────────────────────────────────────────── -->
+<header class="fixed top-0 left-0 right-0 z-50 flex items-center justify-between px-6 md:px-12 h-16"
+  style="background:rgba(11,11,9,0.92); backdrop-filter:blur(20px); border-bottom:1px solid rgba(200,146,42,0.12);">
+  <button onclick="navigate('search')" class="flex items-center gap-3 cursor-pointer">
+    <span class="font-display text-xl font-semibold tracking-wide text-gold">STAYLINK</span>
+    <span class="hidden md:block text-dim text-[10px] tracking-[0.2em] uppercase pt-0.5">Hotels &amp; Resorts</span>
+  </button>
+  <nav class="hidden md:flex items-center gap-8" id="topnav-links"></nav>
+  <button onclick="navigate('profile')" id="topnav-profile-btn" class="flex items-center gap-2.5 text-sm transition-colors text-dim hover:text-cream">
+    <div class="w-8 h-8 rounded-full overflow-hidden border-2" id="topnav-avatar-ring" style="border-color:rgba(200,146,42,0.25);">
+      <img src="https://cdn.pixabay.com/photo/2012/04/26/19/43/profile-42914_1280.png" alt="User" class="w-full h-full object-cover">
+    </div>
+    <span class="hidden md:block">User</span>
+  </button>
+</header>
+
+<!-- ── Views ──────────────────────────────────────────────── -->
+<main id="app-root"></main>
+
+<!-- ── Toast ──────────────────────────────────────────────── -->
+<div id="toast" class="toast hidden items-center gap-2.5 text-sm font-semibold px-6 py-3 rounded-full">
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+  Reservation confirmed!
+</div>
+
+<!-- ── BottomNav (mobile) ─────────────────────────────────── -->
+<nav class="md:hidden fixed bottom-0 left-0 right-0 z-50 flex" id="bottomnav"
+  style="background:rgba(11,11,9,0.97); backdrop-filter:blur(20px); border-top:1px solid rgba(200,146,42,0.12);">
+</nav>
+
+<script>
+/* ============================= DATA ============================= */
+const ROOMS = [
+  { id:1, name:"Deluxe King Room", type:"Deluxe", price:289, size:"42 m²", bed:"1 King Bed", view:"City View", maxGuests:2, rating:4.8, reviews:124,
+    img:"1629140727571-9b5c6f6267b4",
+    description:"A refined sanctuary with floor-to-ceiling windows overlooking the city skyline, appointed with bespoke furniture and a marble en-suite rainfall shower.",
+    amenities:["Free WiFi","Mini Bar","Room Service","55\" TV","Marble Bathroom","Nespresso","In-Room Safe","Robe & Slippers"] },
+  { id:2, name:"Premier Ocean Suite", type:"Suite", price:589, size:"86 m²", bed:"1 King Bed", view:"Ocean View", maxGuests:3, rating:4.9, reviews:89,
+    img:"1578898886225-c7c894047899",
+    description:"An expansive retreat with a private terrace overlooking the ocean, a separate living area, deep soaking tub, and exclusive premier lounge access.",
+    amenities:["Free WiFi","Mini Bar","Butler Service","Soaking Tub","Private Terrace","Lounge Access","Nespresso","Turndown Service"] },
+  { id:3, name:"Executive Twin", type:"Superior", price:219, size:"35 m²", bed:"2 Twin Beds", view:"Garden View", maxGuests:2, rating:4.6, reviews:211,
+    img:"1590675560125-0d832b9d719e",
+    description:"Thoughtfully designed for business travellers or companions, with a dedicated work station and serene garden views to inspire clarity.",
+    amenities:["Free WiFi","Work Desk","Room Service","55\" TV","Rain Shower","Iron & Board","In-Room Safe"] },
+  { id:4, name:"Presidential Suite", type:"Presidential", price:1250, size:"180 m²", bed:"2 King Beds", view:"Panoramic View", maxGuests:6, rating:5.0, reviews:34,
+    img:"1731336478850-6bce7235e320",
+    description:"The pinnacle of hospitality — a private residence with two master bedrooms, formal dining room, full kitchen, and a dedicated butler team on call.",
+    amenities:["Free WiFi","Private Pool","Butler Service","Full Kitchen","Dining Room","Gym Access","Limousine Transfer","Airport Pickup"] },
+  { id:5, name:"Classic Room", type:"Standard", price:159, size:"28 m²", bed:"1 Queen Bed", view:"Courtyard View", maxGuests:2, rating:4.4, reviews:356,
+    img:"1605346434674-a440ca4dc4c0",
+    description:"A classic retreat styled with understated elegance. Every essential comfort for a perfect city escape.",
+    amenities:["Free WiFi","Work Desk","55\" TV","En Suite Bath","In-Room Safe","Daily Housekeeping"] },
+  { id:6, name:"Junior Suite", type:"Suite", price:429, size:"64 m²", bed:"1 King Bed", view:"City View", maxGuests:2, rating:4.7, reviews:78,
+    img:"1742821855309-d26c83bdfe1d",
+    description:"An intimate suite with a plush sitting area, sweeping city views, and exclusive lounge access with complimentary evening canapés.",
+    amenities:["Free WiFi","Mini Bar","Lounge Access","Marble Bathroom","Nespresso Machine","Sitting Area","Turndown Service"] },
+];
+
+const RESERVATIONS = [
+  { id:"RES-2847", room:"Premier Ocean Suite", type:"Suite", checkin:"Aug 15, 2026", checkout:"Aug 19, 2026", nights:4, guests:2, total:2356, status:"upcoming", img:"1578898886225-c7c894047899" },
+  { id:"RES-2791", room:"Deluxe King Room", type:"Deluxe", checkin:"Jul 2, 2026", checkout:"Jul 5, 2026", nights:3, guests:2, total:867, status:"completed", img:"1629140727571-9b5c6f6267b4" },
+  { id:"RES-2644", room:"Junior Suite", type:"Suite", checkin:"May 20, 2026", checkout:"May 22, 2026", nights:2, guests:2, total:858, status:"completed", img:"1742821855309-d26c83bdfe1d" },
+];
+
+function img(id, w=800, h=500){ return `https://images.unsplash.com/photo-${id}?w=${w}&h=${h}&fit=crop&auto=format`; }
+
+/* ============================= ICONS ============================= */
+const Ico = {
+  search:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>`,
+  calendar:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>`,
+  users:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>`,
+  star:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>`,
+  pin:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>`,
+  chevL:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>`,
+  check:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`,
+  bed:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4v16M2 8h20v12M2 12h20M7 8v4"/><rect x="10" y="8" width="12" height="4" rx="1"/></svg>`,
+  building:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v18Z"/><path d="M6 12H4a2 2 0 0 0-2 2v8h4M18 9h2a2 2 0 0 1 2 2v11h-4"/><path d="M10 6h4M10 10h4M10 14h4M10 18h4"/></svg>`,
+  bookmark:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="m19 21-7-4-7 4V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v16z"/></svg>`,
+  user:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="5"/><path d="M3 21v-2a7 7 0 0 1 14 0v2"/></svg>`,
+  minus:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M5 12h14"/></svg>`,
+  plus:s=>`<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>`,
+};
+
+/* ============================= STATE ============================= */
+const state = {
+  view: "search",
+  selectedRoomId: null,
+  search: { location: "Manila, Metro Manila", checkin: "2026-08-15", checkout: "2026-08-19", guests: 2 },
+  rooms: { activeType: "All", sortBy: "rating" },
+  detail: { checkin: "2026-08-15", checkout: "2026-08-19", guests: 2, tab: "overview" },
+};
+
+/* ============================= NAV ============================= */
+const NAV_LINKS = [["search","Discover"],["rooms","Rooms"],["reservations","My Stays"]];
+const BOTTOM_ITEMS = [
+  ["search","Discover","building"], ["rooms","Rooms","bed"],
+  ["reservations","My Stays","bookmark"], ["profile","Profile","user"],
+];
+
+function navigate(v){
+  if (v !== "detail") state.selectedRoomId = null;
+  state.view = v;
+  render();
+  window.scrollTo({top:0, behavior:"instant"});
+}
+function selectRoom(id){
+  state.selectedRoomId = id;
+  state.detail = { checkin:"2026-08-15", checkout:"2026-08-19", guests:2, tab:"overview" };
+  state.view = "detail";
+  render();
+  window.scrollTo({top:0, behavior:"instant"});
+}
+function handleBook(){
+  const toast = document.getElementById('toast');
+  toast.classList.remove('hidden'); toast.classList.add('flex');
+  setTimeout(()=>{
+    toast.classList.add('hidden'); toast.classList.remove('flex');
+    state.selectedRoomId = null;
+    state.view = "reservations";
+    render();
+    window.scrollTo({top:0, behavior:"instant"});
+  }, 2200);
+}
+
+function renderTopNav(){
+  const linksEl = document.getElementById('topnav-links');
+  linksEl.innerHTML = NAV_LINKS.map(([v,label])=>`
+    <button onclick="navigate('${v}')" class="text-sm tracking-wide transition-colors ${state.view===v ? 'text-gold' : 'text-dim hover:text-cream'}">${label}</button>
+  `).join('');
+  const ring = document.getElementById('topnav-avatar-ring');
+  const profileBtn = document.getElementById('topnav-profile-btn');
+  ring.style.borderColor = state.view==='profile' ? '#C8922A' : 'rgba(200,146,42,0.25)';
+  profileBtn.className = `flex items-center gap-2.5 text-sm transition-colors ${state.view==='profile' ? 'text-gold' : 'text-dim hover:text-cream'}`;
+
+  const bottom = document.getElementById('bottomnav');
+  bottom.innerHTML = BOTTOM_ITEMS.map(([v,label,icon])=>`
+    <button onclick="navigate('${v}')" class="flex-1 flex flex-col items-center gap-1 py-3 text-[10px] tracking-wide transition-colors ${state.view===v ? 'text-gold' : 'text-dim'}">
+      ${Ico[icon](22)}${label}
+    </button>
+  `).join('');
+}
+
+/* ============================= ROOM CARD ============================= */
+function roomCardHTML(room, compact, onClickJS){
+  return `
+  <div onclick="${onClickJS}" class="room-card group cursor-pointer rounded-2xl overflow-hidden" style="background:#171612; border:1px solid rgba(200,146,42,0.12);">
+    <div class="relative overflow-hidden ${compact ? 'h-44' : 'h-52'}" style="background:#1E1C16;">
+      <img src="${img(room.img,600,400)}" alt="${room.name}" class="w-full h-full object-cover">
+      <div class="absolute inset-0" style="background:linear-gradient(to top, rgba(11,11,9,0.7), transparent);"></div>
+      <div class="absolute top-3 left-3">
+        <span class="text-[10px] px-2.5 py-1 rounded-full tracking-wider" style="background:rgba(11,11,9,0.7); color:#C8922A; border:1px solid rgba(200,146,42,0.4);">${room.type.toUpperCase()}</span>
+      </div>
+      <div class="absolute bottom-3 right-3 flex items-center gap-1 text-cream text-xs">
+        <span class="text-gold">${Ico.star(14)}</span><span>${room.rating}</span><span class="text-dim">(${room.reviews})</span>
+      </div>
+    </div>
+    <div class="p-5">
+      <h3 class="font-display text-cream text-lg leading-tight mb-1.5">${room.name}</h3>
+      <p class="text-dim text-xs mb-3 flex items-center gap-2 flex-wrap">
+        <span>${room.size}</span><span class="text-gold/40">·</span>
+        <span>${room.bed}</span><span class="text-gold/40">·</span>
+        <span>${room.view}</span>
+      </p>
+      ${!compact ? `<p class="text-dim text-xs leading-relaxed mb-4 line-clamp-2">${room.description}</p>` : ''}
+      <div class="flex items-end justify-between pt-3" style="border-top:1px solid rgba(200,146,42,0.1);">
+        <div><span class="font-display text-2xl text-gold">$${room.price}</span><span class="text-dim text-xs ml-1">/ night</span></div>
+        <span class="text-xs text-gold px-3 py-1.5 rounded-lg" style="border:1px solid rgba(200,146,42,0.3);">View Room →</span>
+      </div>
+    </div>
+  </div>`;
+}
+
+/* ============================= SEARCH VIEW ============================= */
+function renderSearchView(){
+  const s = state.search;
+  return `
+  <div class="pt-16 pb-24 md:pb-10 fade-in">
+    <div class="relative h-[82vh] min-h-[580px] flex items-center justify-center overflow-hidden">
+      <img src="${img('1660557989695-14fac79c086d',1920,1080)}" alt="StayLink Hotel lobby" class="absolute inset-0 w-full h-full object-cover">
+      <div class="absolute inset-0" style="background:linear-gradient(to bottom, rgba(11,11,9,0.55) 0%, rgba(11,11,9,0.35) 40%, rgba(11,11,9,0.85) 100%);"></div>
+      <div class="relative z-10 text-center px-6 w-full max-w-3xl mx-auto">
+        <p class="text-gold text-[10px] tracking-[0.45em] uppercase mb-5">Welcome to</p>
+        <h1 class="font-display text-5xl md:text-7xl font-semibold text-cream leading-[1.1] mb-3">StayLink</h1>
+        <p class="text-dim text-base mb-12 tracking-wide">Manila · Cebu · Boracay · Palawan · Davao</p>
+
+        <div class="rounded-2xl p-2 flex flex-col md:flex-row gap-2" style="background:rgba(23,22,18,0.88); backdrop-filter:blur(20px); border:1px solid rgba(200,146,42,0.18);">
+          <div class="flex-1 flex items-center gap-3 px-4 py-3 rounded-xl cursor-text hover:bg-[#1E1C16] transition-colors">
+            <span class="text-gold flex-shrink-0">${Ico.pin(16)}</span>
+            <div class="text-left min-w-0 w-full">
+              <p class="text-dim text-[10px] mb-0.5 tracking-wider uppercase">Location</p>
+              <input value="${s.location}" oninput="state.search.location=this.value" class="bg-transparent text-cream text-sm w-full outline-none placeholder:text-dim" placeholder="Manila, Cebu, Boracay…">
+            </div>
+          </div>
+          <div class="hidden md:block w-px" style="background:rgba(200,146,42,0.12);"></div>
+          <div class="flex gap-2 flex-1">
+            <div class="flex-1 flex items-center gap-3 px-4 py-3 rounded-xl hover:bg-[#1E1C16] transition-colors">
+              <span class="text-gold flex-shrink-0">${Ico.calendar(16)}</span>
+              <div class="text-left min-w-0 w-full">
+                <p class="text-dim text-[10px] mb-0.5 tracking-wider uppercase">Check-in</p>
+                <input type="date" value="${s.checkin}" oninput="state.search.checkin=this.value" class="bg-transparent text-cream text-sm w-full outline-none cursor-pointer">
+              </div>
+            </div>
+            <div class="flex-1 flex items-center gap-3 px-4 py-3 rounded-xl hover:bg-[#1E1C16] transition-colors">
+              <span class="text-gold flex-shrink-0">${Ico.calendar(16)}</span>
+              <div class="text-left min-w-0 w-full">
+                <p class="text-dim text-[10px] mb-0.5 tracking-wider uppercase">Check-out</p>
+                <input type="date" value="${s.checkout}" oninput="state.search.checkout=this.value" class="bg-transparent text-cream text-sm w-full outline-none cursor-pointer">
+              </div>
+            </div>
+          </div>
+          <div class="hidden md:block w-px" style="background:rgba(200,146,42,0.12);"></div>
+          <div class="flex items-center gap-3 px-4 py-3 rounded-xl">
+            <span class="text-gold flex-shrink-0">${Ico.users(16)}</span>
+            <div class="text-left">
+              <p class="text-dim text-[10px] mb-1.5 tracking-wider uppercase">Guests</p>
+              <div class="flex items-center gap-2.5">
+                <button onclick="adjustSearchGuests(-1)" class="w-6 h-6 rounded-full flex items-center justify-center text-gold hover:bg-gold hover:text-surface transition-colors" style="border:1px solid rgba(200,146,42,0.4);">${Ico.minus(14)}</button>
+                <span class="text-cream text-sm w-4 text-center tabular-nums">${s.guests}</span>
+                <button onclick="adjustSearchGuests(1)" class="w-6 h-6 rounded-full flex items-center justify-center text-gold hover:bg-gold hover:text-surface transition-colors" style="border:1px solid rgba(200,146,42,0.4);">${Ico.plus(14)}</button>
+              </div>
+            </div>
+          </div>
+          <button onclick="navigate('rooms')" class="bg-gold text-surface text-sm font-semibold px-7 py-3 rounded-xl hover:bg-gold-light transition-all flex items-center gap-2 justify-center flex-shrink-0">
+            ${Ico.search(16)} Search
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="max-w-5xl mx-auto px-6">
+      <div class="grid grid-cols-3 gap-3 -mt-5 relative z-10">
+        ${[["120+","Luxury Rooms"],["4.9 ★","Guest Rating"],["18 yrs","Of Excellence"]].map(([val,label])=>`
+          <div class="text-center py-4 px-2 rounded-xl" style="background:#171612; border:1px solid rgba(200,146,42,0.15);">
+            <p class="font-display text-xl md:text-2xl text-gold">${val}</p>
+            <p class="text-dim text-[10px] md:text-xs mt-0.5 tracking-wide">${label}</p>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <div class="max-w-5xl mx-auto px-6 mt-16">
+      <div class="flex items-end justify-between mb-8">
+        <div>
+          <p class="text-gold text-[10px] tracking-[0.35em] uppercase mb-2">Curated For You</p>
+          <h2 class="font-display text-3xl md:text-4xl text-cream">Room Experiences</h2>
+        </div>
+        <button onclick="navigate('rooms')" class="text-gold text-sm hover:text-gold-light transition-colors">View All →</button>
+      </div>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+        ${ROOMS.slice(0,3).map(r=>roomCardHTML(r,true,`navigate('rooms')`)).join('')}
+      </div>
+    </div>
+
+    <div class="max-w-5xl mx-auto px-6 mt-20 mb-4">
+      <p class="text-gold text-[10px] tracking-[0.35em] uppercase mb-2 text-center">The StayLink Promise</p>
+      <h2 class="font-display text-3xl text-cream text-center mb-12">Exceptional by Design</h2>
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+        ${[["🛎","24/7 Concierge","Personal assistance around the clock"],
+           ["🍽","Fine Dining","Three award-winning restaurants on-site"],
+           ["🧖","Wellness Spa","World-class treatments and facilities"],
+           ["🚗","Valet & Transfer","Seamless arrivals and departures"]].map(([icon,title,desc])=>`
+          <div class="text-center p-6 rounded-2xl transition-all duration-300" style="border:1px solid rgba(200,146,42,0.12);"
+               onmouseenter="this.style.borderColor='rgba(200,146,42,0.3)'" onmouseleave="this.style.borderColor='rgba(200,146,42,0.12)'">
+            <div class="text-3xl mb-4">${icon}</div>
+            <p class="text-cream text-sm font-medium mb-2">${title}</p>
+            <p class="text-dim text-xs leading-relaxed">${desc}</p>
+          </div>`).join('')}
+      </div>
+    </div>
+  </div>`;
+}
+function adjustSearchGuests(d){
+  state.search.guests = Math.min(8, Math.max(1, state.search.guests + d));
+  render();
+}
+
+/* ============================= ROOMS VIEW ============================= */
+function renderRoomsView(){
+  const { activeType, sortBy } = state.rooms;
+  const types = ["All","Standard","Superior","Deluxe","Suite","Presidential"];
+  let filtered = ROOMS.filter(r=> activeType==="All" || r.type===activeType);
+  filtered = filtered.sort((a,b)=>{
+    if (sortBy==="price-asc") return a.price-b.price;
+    if (sortBy==="price-desc") return b.price-a.price;
+    return b.rating-a.rating;
+  });
+  return `
+  <div class="pt-24 pb-28 md:pb-10 px-6 max-w-6xl mx-auto fade-in">
+    <div class="mb-8">
+      <p class="text-gold text-[10px] tracking-[0.35em] uppercase mb-2">StayLink</p>
+      <h2 class="font-display text-4xl md:text-5xl text-cream">Rooms &amp; Suites</h2>
+    </div>
+    <div class="flex flex-wrap items-center gap-2.5 mb-8">
+      <div class="flex gap-2 flex-wrap flex-1">
+        ${types.map(t=>`
+          <button onclick="setRoomsType('${t}')" class="text-xs px-4 py-2 rounded-full transition-all"
+            style="background:${activeType===t ? '#C8922A' : 'transparent'}; color:${activeType===t ? '#0B0B09' : '#9B9488'}; border:${activeType===t ? '1px solid #C8922A' : '1px solid rgba(200,146,42,0.2)'}; font-weight:${activeType===t ? '600' : '400'};">
+            ${t}
+          </button>`).join('')}
+      </div>
+      <select onchange="setRoomsSort(this.value)" class="text-dim text-xs px-3 py-2 rounded-lg outline-none cursor-pointer hover:text-cream transition-colors" style="background:#171612; border:1px solid rgba(200,146,42,0.2);">
+        <option value="rating" ${sortBy==='rating'?'selected':''}>Top Rated</option>
+        <option value="price-asc" ${sortBy==='price-asc'?'selected':''}>Price: Low → High</option>
+        <option value="price-desc" ${sortBy==='price-desc'?'selected':''}>Price: High → Low</option>
+      </select>
+    </div>
+    ${filtered.length>0 ? `
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+        ${filtered.map(r=>roomCardHTML(r,false,`selectRoom(${r.id})`)).join('')}
+      </div>` : `
+      <div class="text-center py-20"><p class="font-display text-2xl text-dim">No rooms match this filter.</p></div>`}
+  </div>`;
+}
+function setRoomsType(t){ state.rooms.activeType = t; render(); }
+function setRoomsSort(v){ state.rooms.sortBy = v; render(); }
+
+/* ============================= ROOM DETAIL VIEW ============================= */
+function renderDetailView(){
+  const room = ROOMS.find(r=>r.id===state.selectedRoomId);
+  if (!room) { navigate('rooms'); return ''; }
+  const d = state.detail;
+  const nights = Math.max(1, Math.round((new Date(d.checkout) - new Date(d.checkin)) / 86400000));
+  const subtotal = room.price * nights;
+  const taxes = Math.round(subtotal * 0.12);
+  const total = subtotal + taxes;
+
+  const tabsHTML = ["overview","amenities","policies"].map(t=>`
+    <button onclick="setDetailTab('${t}')" class="capitalize text-sm pb-4 -mb-px transition-colors"
+      style="color:${d.tab===t?'#C8922A':'#9B9488'}; border-bottom:${d.tab===t?'2px solid #C8922A':'2px solid transparent'};">${t}</button>
+  `).join('');
+
+  let tabContent = '';
+  if (d.tab === 'overview'){
+    tabContent = `
+      <p class="text-dim leading-relaxed mb-8">${room.description}</p>
+      <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+        ${[["Room Size",room.size],["Bed Type",room.bed],["View",room.view],["Max Guests",`${room.maxGuests} Guests`],["Floor","14th – 18th"],["Check-in","3:00 PM"]].map(([k,v])=>`
+          <div class="rounded-xl p-4" style="background:#171612; border:1px solid rgba(200,146,42,0.12);">
+            <p class="text-dim text-xs mb-1">${k}</p><p class="text-cream text-sm font-medium">${v}</p>
+          </div>`).join('')}
+      </div>`;
+  } else if (d.tab === 'amenities'){
+    tabContent = `
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        ${room.amenities.map(a=>`
+          <div class="flex items-center gap-3 text-dim text-sm">
+            <span class="w-5 h-5 rounded-full flex items-center justify-center text-gold flex-shrink-0" style="background:rgba(200,146,42,0.1); border:1px solid rgba(200,146,42,0.3);">${Ico.check(14)}</span>
+            ${a}
+          </div>`).join('')}
+      </div>`;
+  } else {
+    tabContent = `
+      <div class="space-y-4 text-sm text-dim leading-relaxed">
+        ${[["Cancellation Policy","Free cancellation up to 48 hours before check-in. Cancellations within 48 hours incur a one-night charge."],
+           ["Check-in & Check-out","Check-in from 3:00 PM · Check-out by 12:00 PM. Early check-in and late check-out available on request, subject to availability."],
+           ["House Rules","Non-smoking property throughout. Pets are not permitted. Quiet hours are observed after 11:00 PM."]].map(([title,body])=>`
+          <div class="rounded-xl p-5" style="background:#171612; border:1px solid rgba(200,146,42,0.12);">
+            <p class="text-cream font-medium mb-2">${title}</p><p>${body}</p>
+          </div>`).join('')}
+      </div>`;
+  }
+
+  return `
+  <div class="pt-16 pb-28 md:pb-10 min-h-screen fade-in">
+    <div class="relative h-72 md:h-[460px] overflow-hidden" style="background:#1E1C16;">
+      <img src="${img(room.img,1400,700)}" alt="${room.name}" class="w-full h-full object-cover">
+      <div class="absolute inset-0" style="background:linear-gradient(to top, rgba(11,11,9,0.85), rgba(11,11,9,0.2) 60%, transparent);"></div>
+      <button onclick="navigate('rooms')" class="absolute top-6 left-6 flex items-center gap-1.5 text-cream text-sm px-4 py-2 rounded-full" style="background:rgba(11,11,9,0.65); backdrop-filter:blur(12px); border:1px solid rgba(237,232,220,0.12);">
+        ${Ico.chevL(16)} Back
+      </button>
+      <div class="absolute bottom-6 left-6 right-6 md:right-auto md:max-w-xl">
+        <div class="flex items-center gap-2.5 mb-3">
+          <span class="text-[10px] px-2.5 py-1 rounded-full tracking-wider" style="background:rgba(200,146,42,0.15); color:#C8922A; border:1px solid rgba(200,146,42,0.4);">${room.type.toUpperCase()}</span>
+          <span class="flex items-center gap-1 text-cream text-xs"><span class="text-gold">${Ico.star(14)}</span>${room.rating} · ${room.reviews} reviews</span>
+        </div>
+        <h1 class="font-display text-3xl md:text-4xl text-cream mb-1">${room.name}</h1>
+        <p class="text-dim text-sm">${room.size} · ${room.bed} · ${room.view} · Up to ${room.maxGuests} guests</p>
+      </div>
+    </div>
+
+    <div class="max-w-6xl mx-auto px-6 mt-8 grid grid-cols-1 md:grid-cols-[1fr_340px] gap-10">
+      <div>
+        <div class="flex gap-8 mb-8" style="border-bottom:1px solid rgba(200,146,42,0.12);">${tabsHTML}</div>
+        ${tabContent}
+      </div>
+
+      <div class="md:sticky md:top-24 self-start">
+        <div class="rounded-2xl p-6" style="background:#171612; border:1px solid rgba(200,146,42,0.18);">
+          <div class="flex items-baseline gap-1 mb-6">
+            <span class="font-display text-3xl text-gold">$${room.price}</span><span class="text-dim text-sm">/ night</span>
+          </div>
+          <div class="space-y-2.5 mb-5">
+            <div class="grid grid-cols-2 gap-2.5">
+              <div class="rounded-xl p-3" style="background:#0B0B09; border:1px solid rgba(200,146,42,0.15);">
+                <label class="text-dim text-[10px] block mb-1 uppercase tracking-wider">Check-in</label>
+                <input type="date" value="${d.checkin}" oninput="setDetailDate('checkin', this.value)" class="bg-transparent text-cream text-sm w-full outline-none cursor-pointer">
+              </div>
+              <div class="rounded-xl p-3" style="background:#0B0B09; border:1px solid rgba(200,146,42,0.15);">
+                <label class="text-dim text-[10px] block mb-1 uppercase tracking-wider">Check-out</label>
+                <input type="date" value="${d.checkout}" oninput="setDetailDate('checkout', this.value)" class="bg-transparent text-cream text-sm w-full outline-none cursor-pointer">
+              </div>
+            </div>
+            <div class="rounded-xl p-3 flex items-center justify-between" style="background:#0B0B09; border:1px solid rgba(200,146,42,0.15);">
+              <div>
+                <p class="text-dim text-[10px] mb-1.5 uppercase tracking-wider">Guests</p>
+                <div class="flex items-center gap-3">
+                  <button onclick="adjustDetailGuests(-1)" class="w-6 h-6 rounded-full flex items-center justify-center text-gold hover:bg-gold hover:text-surface transition-colors" style="border:1px solid rgba(200,146,42,0.4);">${Ico.minus(14)}</button>
+                  <span class="text-cream text-sm tabular-nums">${d.guests} Guest${d.guests!==1?'s':''}</span>
+                  <button onclick="adjustDetailGuests(1)" class="w-6 h-6 rounded-full flex items-center justify-center text-gold hover:bg-gold hover:text-surface transition-colors" style="border:1px solid rgba(200,146,42,0.4);">${Ico.plus(14)}</button>
+                </div>
+              </div>
+              <span class="text-dim text-xs">Max ${room.maxGuests}</span>
+            </div>
+          </div>
+          <div class="space-y-2 mb-5 pt-4" style="border-top:1px solid rgba(200,146,42,0.12);">
+            <div class="flex justify-between text-sm text-dim"><span>$${room.price} × ${nights} nights</span><span class="text-cream tabular-nums">$${subtotal.toLocaleString()}</span></div>
+            <div class="flex justify-between text-sm text-dim"><span>Taxes &amp; fees (12%)</span><span class="text-cream tabular-nums">$${taxes.toLocaleString()}</span></div>
+            <div class="flex justify-between font-semibold pt-2.5 mt-1" style="border-top:1px solid rgba(200,146,42,0.12);">
+              <span class="text-cream text-sm">Total</span><span class="font-display text-xl text-gold">$${total.toLocaleString()}</span>
+            </div>
+          </div>
+          <button onclick="handleBook()" class="w-full bg-gold text-surface text-sm font-semibold py-4 rounded-xl hover:bg-gold-light transition-all tracking-wide">Reserve Now</button>
+          <p class="text-dim text-[11px] text-center mt-3">Free cancellation · No charge today</p>
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+function setDetailTab(t){ state.detail.tab = t; render(); }
+function setDetailDate(which, v){ state.detail[which] = v; render(); }
+function adjustDetailGuests(dlt){
+  const room = ROOMS.find(r=>r.id===state.selectedRoomId);
+  state.detail.guests = Math.min(room.maxGuests, Math.max(1, state.detail.guests + dlt));
+  render();
+}
+
+/* ============================= RESERVATIONS VIEW ============================= */
+function renderReservationsView(){
+  const upcoming = RESERVATIONS.filter(r=>r.status==='upcoming');
+  const past = RESERVATIONS.filter(r=>r.status==='completed');
+  return `
+  <div class="pt-24 pb-28 md:pb-10 px-6 max-w-3xl mx-auto fade-in">
+    <div class="mb-10">
+      <p class="text-gold text-[10px] tracking-[0.35em] uppercase mb-2">James Keller</p>
+      <h2 class="font-display text-4xl md:text-5xl text-cream">My Stays</h2>
+    </div>
+    ${upcoming.length>0 ? `
+    <section class="mb-10">
+      <h3 class="text-cream text-xs font-medium tracking-[0.2em] uppercase mb-4">Upcoming</h3>
+      <div class="space-y-4">
+        ${upcoming.map(res=>`
+          <div class="rounded-2xl overflow-hidden" style="background:#171612; border:1px solid rgba(200,146,42,0.18);">
+            <div class="flex flex-col sm:flex-row">
+              <div class="relative sm:w-48 h-44 sm:h-auto flex-shrink-0 overflow-hidden" style="background:#1E1C16;">
+                <img src="${img(res.img,400,300)}" alt="${res.room}" class="w-full h-full object-cover">
+                <div class="absolute inset-0" style="background:linear-gradient(to top, rgba(11,11,9,0.4), transparent);"></div>
+              </div>
+              <div class="flex-1 p-6">
+                <div class="mb-4">
+                  <span class="inline-flex items-center gap-1.5 text-[10px] px-2.5 py-1 rounded-full mb-2 tracking-wide" style="background:rgba(200,146,42,0.12); color:#C8922A; border:1px solid rgba(200,146,42,0.3);">● Confirmed · ${res.id}</span>
+                  <h4 class="font-display text-cream text-xl">${res.room}</h4>
+                  <p class="text-dim text-xs mt-0.5">${res.type} · ${res.guests} Guests</p>
+                </div>
+                <div class="grid grid-cols-3 gap-3 mb-5">
+                  ${[["Check-in",res.checkin],["Check-out",res.checkout],["Duration",`${res.nights} Nights`]].map(([k,v])=>`
+                    <div><p class="text-dim text-[10px] mb-0.5 uppercase tracking-wider">${k}</p><p class="text-cream text-xs font-medium">${v}</p></div>`).join('')}
+                </div>
+                <div class="flex items-center justify-between">
+                  <p class="text-dim text-sm">Total: <span class="font-display text-xl text-gold ml-1">$${res.total.toLocaleString()}</span></p>
+                  <div class="flex gap-2">
+                    <button class="text-xs text-dim px-3 py-1.5 rounded-lg hover:text-cream transition-colors" style="border:1px solid rgba(200,146,42,0.15);">Modify</button>
+                    <button class="text-xs text-gold px-3 py-1.5 rounded-lg hover:bg-gold hover:text-surface transition-all" style="border:1px solid rgba(200,146,42,0.35);">Check-in Details</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>`).join('')}
+      </div>
+    </section>` : ''}
+    ${past.length>0 ? `
+    <section>
+      <h3 class="text-cream text-xs font-medium tracking-[0.2em] uppercase mb-4">Past Stays</h3>
+      <div class="space-y-3">
+        ${past.map(res=>`
+          <div class="flex items-center gap-4 p-4 rounded-xl" style="background:#171612; border:1px solid rgba(200,146,42,0.1);">
+            <div class="w-14 h-14 rounded-xl overflow-hidden flex-shrink-0" style="background:#1E1C16;">
+              <img src="${img(res.img,80,80)}" alt="${res.room}" class="w-full h-full object-cover opacity-60">
+            </div>
+            <div class="flex-1 min-w-0">
+              <p class="text-cream text-sm font-medium truncate">${res.room}</p>
+              <p class="text-dim text-xs mt-0.5">${res.checkin} → ${res.checkout} · ${res.nights} nights</p>
+            </div>
+            <div class="text-right flex-shrink-0">
+              <p class="text-dim text-[10px] mb-0.5">${res.id}</p>
+              <p class="text-gold text-sm font-medium">$${res.total.toLocaleString()}</p>
+            </div>
+          </div>`).join('')}
+      </div>
+    </section>` : ''}
+  </div>`;
+}
+
+/* ============================= PROFILE VIEW ============================= */
+function renderProfileView(){
+  return `
+  <div class="pt-24 pb-28 md:pb-10 px-6 max-w-2xl mx-auto fade-in">
+    <div class="rounded-2xl p-6 mb-5 flex items-center gap-5" style="background:#171612; border:1px solid rgba(200,146,42,0.18);">
+      <div class="w-20 h-20 rounded-full overflow-hidden flex-shrink-0" style="border:2px solid rgba(200,146,42,0.5);">
+        <img src="https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=80&h=80&fit=crop&auto=format" alt="James Keller" class="w-full h-full object-cover">
+      </div>
+      <div class="flex-1">
+        <p class="text-gold text-[10px] tracking-[0.3em] uppercase mb-1">Gold Member</p>
+        <h2 class="font-display text-2xl text-cream">James Keller</h2>
+        <p class="text-dim text-xs mt-0.5">james.keller@staylink.com · Since 2022</p>
+      </div>
+      <span class="font-display text-2xl text-gold opacity-60">✦</span>
+    </div>
+
+    <div class="rounded-2xl p-6 mb-5" style="background:#171612; border:1px solid rgba(200,146,42,0.18);">
+      <div class="flex items-start justify-between mb-5">
+        <div>
+          <p class="text-dim text-[10px] uppercase tracking-[0.2em] mb-1">Loyalty Points</p>
+          <p class="font-display text-4xl text-gold">12,450</p>
+        </div>
+        <div class="text-right">
+          <p class="text-dim text-xs mb-1">Next Tier: Platinum</p>
+          <p class="text-cream text-sm font-medium">2,550 pts to go</p>
+        </div>
+      </div>
+      <div class="h-1.5 rounded-full overflow-hidden" style="background:#0B0B09;">
+        <div class="h-full rounded-full" style="width:83%; background:linear-gradient(to right, #C8922A, #E8B84B);"></div>
+      </div>
+      <div class="flex justify-between mt-2">
+        <span class="text-dim text-[10px]">Gold (10,000)</span><span class="text-dim text-[10px]">Platinum (15,000)</span>
+      </div>
+    </div>
+
+    <div class="grid grid-cols-3 gap-3 mb-5">
+      ${[["9","Total Stays"],["22","Nights"],["3","Destinations"]].map(([val,label])=>`
+        <div class="text-center py-5 rounded-xl" style="background:#171612; border:1px solid rgba(200,146,42,0.12);">
+          <p class="font-display text-3xl text-gold">${val}</p><p class="text-dim text-[10px] mt-1 tracking-wide">${label}</p>
+        </div>`).join('')}
+    </div>
+
+    <div class="rounded-2xl p-6 mb-4" style="background:#171612; border:1px solid rgba(200,146,42,0.12);">
+      <h3 class="text-cream text-xs font-medium tracking-[0.2em] uppercase mb-5">Room Preferences</h3>
+      <div class="space-y-4">
+        ${[["Pillow Type","Firm"],["Floor Preference","High Floor (15+)"],["Dietary Needs","No restrictions"],["Morning Newspaper","Financial Times"],["Bed Turn-down","8:00 PM"]].map(([k,v])=>`
+          <div class="flex items-center justify-between text-sm" style="border-bottom:1px solid rgba(200,146,42,0.07);">
+            <span class="text-dim pb-3">${k}</span><span class="text-cream pb-3">${v}</span>
+          </div>`).join('')}
+      </div>
+    </div>
+
+    <button class="w-full text-dim text-sm py-3.5 rounded-xl hover:text-cream transition-all" style="border:1px solid rgba(200,146,42,0.15);"
+      onmouseenter="this.style.borderColor='rgba(200,146,42,0.35)'" onmouseleave="this.style.borderColor='rgba(200,146,42,0.15)'">
+      Edit Profile
+    </button>
+  </div>`;
+}
+
+/* ============================= RENDER ROOT ============================= */
+function render(){
+  renderTopNav();
+  const root = document.getElementById('app-root');
+  let html = '';
+  switch(state.view){
+    case 'search': html = renderSearchView(); break;
+    case 'rooms': html = renderRoomsView(); break;
+    case 'detail': html = renderDetailView(); break;
+    case 'reservations': html = renderReservationsView(); break;
+    case 'profile': html = renderProfileView(); break;
+    default: html = renderSearchView();
+  }
+  root.innerHTML = html;
+}
+
+render();
+</script>
+</body>
+</html>
