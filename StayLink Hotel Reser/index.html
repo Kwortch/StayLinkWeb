@@ -1412,12 +1412,8 @@ createReservationTransaction = async function(room,detail,guestInfo,reservationI
   const physicalQuerySnap=await db.collection("rooms").where("roomTypeId","==",room.id).get();
   const physicalRefs=physicalQuerySnap.docs.map(doc=>doc.ref);
   await db.runTransaction(async tx=>{
-    const physicalDocs=await Promise.all(physicalRefs.map(ref=>tx.get(ref)));
-    const existingReservation=await tx.get(reservationRef);
-    if (existingReservation.exists) {
-      if (existingReservation.data().guestUid !== currentUser().uid) throw new Error("Unable to reuse this reservation attempt.");
-      return;
-    }
+    const physicalDocs=[];
+    for (const ref of physicalRefs) physicalDocs.push(await tx.get(ref));
     const requestedStart=new Date(`${detail.checkin}T00:00:00`).getTime(), requestedEnd=new Date(`${detail.checkout}T00:00:00`).getTime();
     const availablePhysical=physicalDocs.filter(doc => {
       const roomData=doc.data();
@@ -1484,7 +1480,10 @@ handleBook = async function(){
   } catch (e) {
     bookingInProgress = false;
     bookingAttemptId = null;
-    state.auth.error=e.message||"Unable to create reservation.";
+    const message = e && e.message ? e.message : "Unable to create reservation.";
+    console.error("Reservation save failed", e);
+    toast(`Reservation was not saved: ${message}`);
+    state.auth.error=message;
     render();
   }
 };
