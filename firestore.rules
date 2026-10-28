@@ -26,25 +26,16 @@ service cloud.firestore {
     // Only admin accounts can change it.
     match /rooms/{roomId} {
       allow read: if true;
-      allow create: if isAdminEmail() ||
-        (request.auth != null &&
-         request.resource.data.availabilityCount >= 0 &&
-         request.resource.data.status in ['Available', 'Occupied']);
+      allow create: if isAdminEmail();
       allow delete: if isAdminEmail();
-      // Guests may only reserve or release one inventory unit. Admins retain
-      // full control over status and inventory.
+      // Guest booking holds may update a physical room's booking dates, but
+      // only staff can change room status or inventory.
       allow update: if isAdminEmail() ||
-        (request.auth != null &&
-         request.resource.data.diff(resource.data).affectedKeys()
-           .hasOnly(['availabilityCount', 'status', 'updatedAt']) &&
-         (request.resource.data.availabilityCount == resource.data.availabilityCount - 1 ||
-          request.resource.data.availabilityCount == resource.data.availabilityCount + 1)) ||
         (request.auth != null &&
          resource.data.roomTypeId != null &&
          request.resource.data.diff(resource.data).affectedKeys()
-           .hasOnly(['bookings', 'status', 'updatedAt']) &&
-         request.resource.data.status in ['Available', 'Occupied'] &&
-         resource.data.status in ['Available', 'Occupied']);
+           .hasOnly(['bookings', 'updatedAt']) &&
+         request.resource.data.status == resource.data.status);
     }
 
     // Reservations.
@@ -55,13 +46,27 @@ service cloud.firestore {
     // - Nobody can delete a reservation (cancel = status update, keeps a record).
     match /reservations/{resId} {
       allow create: if request.auth != null
-                    && request.resource.data.guestUid == request.auth.uid;
+                    && request.resource.data.guestUid == request.auth.uid
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.assignedRoomId is string;
 
       allow read: if request.auth != null &&
                   (resource.data.guestUid == request.auth.uid || isAdminEmail());
 
-      allow update: if request.auth != null &&
-                    (resource.data.guestUid == request.auth.uid || isAdminEmail());
+      allow update: if isAdminEmail() ||
+                    (request.auth != null &&
+                     resource.data.guestUid == request.auth.uid &&
+                     request.resource.data.status == 'cancelled' &&
+                     resource.data.status in ['pending', 'confirmed'] &&
+                     request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['status', 'cancellationReason', 'cancelledAt', 'updatedAt'])) ||
+                    (request.auth != null &&
+                     resource.data.guestUid == request.auth.uid &&
+                     resource.data.status == 'checked-out' &&
+                     request.resource.data.status == 'checked-out' &&
+                     request.resource.data.loyaltyPointsAwarded == true &&
+                     request.resource.data.diff(resource.data).affectedKeys()
+                       .hasOnly(['loyaltyPointsAwarded', 'loyaltyPointsEarned', 'loyaltyLockedAt', 'updatedAt']));
 
       allow delete: if false;
     }

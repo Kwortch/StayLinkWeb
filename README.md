@@ -128,16 +128,21 @@ StayLink/
 3. Selecting **Reserve** requires authentication. A visitor can sign in or
    create an account and then return to the selected room.
 4. The app calculates the subtotal from the nightly rate and number of nights,
-   adds 12% tax, and    writes the reservation to Firestore with `status: "pending"`.
+   adds 12% tax, and writes the reservation to Firestore with
+   `status: "pending"`.
 5. The first available physical room is assigned and held while the
    reservation awaits staff approval. The reservation appears as `Pending` in
    **My Stays**.
 6. Staff can accept the request (`confirmed`) or reject it (`rejected`).
-   Rejection removes the date-bound booking block and returns the physical room
-   to `Available`.
-7. A guest can cancel their own reservation. Cancellation is stored as a
+   Rejection removes the date-bound booking block. Acceptance alone does not
+   mark the room occupied.
+7. When the guest arrives, staff use **Check In** on the accepted reservation.
+   That action marks its assigned physical room `Occupied` and reduces the
+   room type's available inventory. **Check Out** moves that room to `Cleaning`;
+   staff must mark it `Available` in Rooms & Inventory after it is ready.
+8. A guest can cancel their own reservation. Cancellation is stored as a
    status update so the reservation history remains available.
-8. An allow-listed staff account can review all reservations and update room
+9. An allow-listed staff account can review all reservations and update room
    or reservation statuses from the dashboard.
 
 ## Firebase data model
@@ -159,7 +164,9 @@ availabilityCount: number
 ```
 
 Room documents are publicly readable so visitors can see live availability.
-Only admin accounts can write room status.
+Guests can add date-bound booking holds, but only admin accounts can change a
+room's operational status or inventory. `Occupied` is set by staff check-in,
+not by reservation creation or acceptance.
 
 ### `reservations/{reservationId}`
 

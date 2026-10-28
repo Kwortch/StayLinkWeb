@@ -49,13 +49,16 @@ served by Firebase Hosting or the emulator.
 ## What's now real vs. still a demo simplification
 - **Real:** email/password accounts, reservations written to Firestore,
   "My Stays" reads only the signed-in guest's own bookings, room
-  Available/Occupied/Cleaning status is live and admin-editable, the admin
-  dashboard reads real reservation + room data.
+  Available/Occupied/Cleaning status is live, and the admin dashboard reads
+  real reservation + room data. Reservations start Pending; staff must accept
+  a request and then check the guest in before its assigned room becomes
+  Occupied or inventory is reduced. Checking out moves that room to Cleaning;
+  staff must mark it Available after cleaning.
 - **Simplified on purpose (documented, easy to extend later):** room
   *content* (name, photos, description, amenities) still lives in the
   `ROOMS` array in code rather than Firestore — only the parts that actually
-  change at runtime (status, bookings) are in the database. Booking a room
-  marks it "Occupied" outright rather than checking for date-range overlaps
-  against other reservations. Admin access is a simple email allow-list
-  rather than Firebase custom claims — fine for a capstone demo, but worth
-  mentioning as a "future work" limitation in your documentation.
+  change at runtime (status, bookings) are in the database. Date-range holds
+  prevent overlapping reservations for the same physical room. Admin access is
+  a simple email allow-list rather than Firebase custom claims — fine for a
+  capstone demo, but worth mentioning as a "future work" limitation in your
+  documentation.

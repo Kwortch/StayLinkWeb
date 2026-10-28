@@ -212,6 +212,37 @@ async function ensurePhysicalRooms(){
   });
   if (writes) await batch.commit();
 }
+async function reconcilePhysicalRoomOccupancy(){
+  if (!fbReady || !isAdmin()) return;
+  const [reservationSnap, roomSnap] = await Promise.all([
+    db.collection("reservations").get(),
+    db.collection("rooms").get()
+  ]);
+  const checkedInByRoom = new Map();
+  reservationSnap.forEach(doc => {
+    const reservation = doc.data();
+    if (normalizedStatus(reservation.status) === "checked-in" && reservation.assignedRoomId) {
+      checkedInByRoom.set(reservation.assignedRoomId, doc.id);
+    }
+  });
+  const batch = db.batch();
+  let writes = 0;
+  roomSnap.forEach(doc => {
+    const room = doc.data();
+    if (room.roomTypeId == null) return;
+    const checkedInReservationId = checkedInByRoom.get(doc.id);
+    if (checkedInReservationId) {
+      if (room.status !== "Occupied" || room.occupiedReservationId !== checkedInReservationId) {
+        batch.update(doc.ref,{status:"Occupied",occupiedReservationId:checkedInReservationId,updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+        writes++;
+      }
+    } else if (room.status === "Occupied" || room.occupiedReservationId) {
+      batch.update(doc.ref,{status:"Available",occupiedReservationId:firebase.firestore.FieldValue.delete(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+      writes++;
+    }
+  });
+  if (writes) await batch.commit();
+}
 async function syncRoomTypeSummaries(){
   if (!fbReady || !isAdmin() || !physicalRooms.length) return;
   const batch = db.batch();
@@ -279,7 +310,7 @@ async function processCompletedReservations(){
   if (!fbReady || !currentUser()) return;
   const today = new Date().toISOString().slice(0,10);
   for (const reservation of myReservations) {
-    if (normalizedStatus(reservation.status) !== "confirmed" ||
+    if (normalizedStatus(reservation.status) !== "checked-out" ||
         String(reservation.checkout || reservation.checkOut || "") >= today ||
         reservation.loyaltyPointsAwarded) continue;
     try {
@@ -288,13 +319,13 @@ async function processCompletedReservations(){
       await db.runTransaction(async tx => {
         const [reservationSnap,userSnap] = await Promise.all([tx.get(reservationRef),tx.get(userRef)]);
         const current = reservationSnap.data() || {};
-        if (current.loyaltyPointsAwarded || normalizedStatus(current.status) !== "confirmed") return;
+        if (current.loyaltyPointsAwarded || normalizedStatus(current.status) !== "checked-out") return;
         const profile = userSnap.data() || {};
         const points = Number(profile.loyaltyPoints || 0);
         const tier = tierForPoints(points);
         const earned = Math.floor((Number(current.total || current.totalPrice || 0) / 100) * tier.rate);
         const nextPoints = points + earned;
-        tx.update(reservationRef,{status:"completed",loyaltyPointsAwarded:true,loyaltyPointsEarned:earned,loyaltyLockedAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+        tx.update(reservationRef,{loyaltyPointsAwarded:true,loyaltyPointsEarned:earned,loyaltyLockedAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
         tx.set(userRef,{loyaltyPoints:nextPoints,membership:tierForPoints(nextPoints).name,updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
       });
     } catch (e) { console.warn("loyalty completion error:", e); }
@@ -335,12 +366,11 @@ async function createReservation(room, detail, guestInfo){
     checkout: detail.checkout,
     nights, guests: detail.guests,
     subtotal, taxes, total,
-    status: "confirmed",
+    status: "pending",
     createdAtMs: Date.now(),
     createdAt: firebase.firestore.FieldValue.serverTimestamp(),
   };
   await db.collection("reservations").add(payload);
-  await db.collection("rooms").doc(String(room.id)).set({ status: "Occupied" }, { merge:true });
   return ref;
 }
 async function setReservationStatus(id, status){
@@ -508,15 +538,17 @@ function enhancedRenderDetailView(){
 async function enhancedCreateReservation(room,detail,guestInfo){
   if(!fbReady||!currentUser())throw new Error("Please sign in before booking.");
   const nights=Math.max(1,Math.round((new Date(detail.checkout)-new Date(detail.checkin))/86400000));if(nights<1)throw new Error("Check-out must be after check-in.");
-  const extras={breakfast:!!detail.breakfast,spa:!!detail.spa},extrasPrice=(extras.breakfast?450:0)+(extras.spa?850:0),subtotal=room.price*nights,taxes=Math.round((subtotal+extrasPrice)*.12),total=subtotal+extrasPrice+taxes,ref=genReference(),reservationRef=db.collection("reservations").doc(),roomRef=db.collection("rooms").doc(String(room.id));
+  const extras={breakfast:!!detail.breakfast,spa:!!detail.spa},extrasPrice=(extras.breakfast?450:0)+(extras.spa?850:0),subtotal=room.price*nights,taxes=Math.round((subtotal+extrasPrice)*.12),total=subtotal+extrasPrice+taxes,ref=genReference(),reservationRef=db.collection("reservations").doc();
+  const physicalQuery=db.collection("rooms").where("roomTypeId","==",room.id);
+  const physicalRoomRefs=(await physicalQuery.get()).docs.map(doc=>doc.ref);
+  if(!physicalRoomRefs.length)throw new Error("Room inventory is not initialized. Please contact hotel staff.");
   await db.runTransaction(async tx=>{
-    let assignedRoom=null;
-    const physicalQuery=db.collection("rooms").where("roomTypeId","==",room.id);
-    const physicalSnap=await tx.get(physicalQuery);
-    const physicalAvailable=physicalSnap.docs.filter(doc => (doc.data().status || "Available") === "Available");
-    const snap=await tx.get(roomRef),data=snap.exists?snap.data():{},count=physicalSnap.size ? physicalAvailable.length : Number(data.availabilityCount??room.availability??0);
+    const physicalDocs=await Promise.all(physicalRoomRefs.map(ref=>tx.get(ref)));
+    const physicalAvailable=physicalDocs.filter(doc => doc.exists && (doc.data().status || "Available") === "Available");
+    const count=physicalAvailable.length;
     if(count<=0)throw new Error("Only 0 rooms left at this price.");
     const requestedStart=new Date(`${detail.checkin}T00:00:00`).getTime(), requestedEnd=new Date(`${detail.checkout}T00:00:00`).getTime();
+    let assignedRoom=null;
     for(const physicalDoc of physicalAvailable){
       const physicalData=physicalDoc.data();
       if((physicalData.status||"Available")!=="Available")continue;
@@ -526,23 +558,22 @@ async function enhancedCreateReservation(room,detail,guestInfo){
       });
       if(!occupied){assignedRoom={id:physicalDoc.id,...physicalData};break;}
     }
-    if(!assignedRoom && physicalSnap.size)throw new Error(`Only ${count} room${count===1?"":"s"} left at this price.`);
-    tx.set(roomRef,{availabilityCount:Math.max(0,count-1),status:count===1?"Occupied":"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+    if(!assignedRoom)throw new Error(`Only ${count} room${count===1?"":"s"} left at this price.`);
     if(assignedRoom){
       const assignedRef=db.collection("rooms").doc(assignedRoom.id);
-      tx.update(assignedRef,{status:"Occupied",bookings:[...(assignedRoom.bookings||[]),{reservationId:reservationRef.id,checkin:detail.checkin,checkout:detail.checkout}],updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+      tx.update(assignedRef,{bookings:[...(assignedRoom.bookings||[]),{reservationId:reservationRef.id,checkin:detail.checkin,checkout:detail.checkout}],updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
     }
-    tx.set(reservationRef,{reference:ref,reservationId:reservationRef.id,roomId:room.id,roomTypeId:room.id,roomTypeName:room.name,assignedRoomId:assignedRoom&&assignedRoom.id,assignedRoomNumber:assignedRoom&&assignedRoom.roomNumber,roomName:room.name,roomType:room.type,roomImage:room.img,destination:room.destination,location:room.location,guestUid:currentUser().uid,userId:currentUser().uid,guestName:guestInfo.name,leadGuest:guestInfo.name,guestEmail:guestInfo.email,contactNumber:guestInfo.contactNumber,checkin:detail.checkin,checkIn:detail.checkin,checkout:detail.checkout,checkOut:detail.checkout,checkinTime:detail.checkinTime||"15:00",nights,guests:detail.guests,extras,roomPrice:room.price,extrasPrice,subtotal,taxes,totalPrice:total,total,status:"confirmed",createdAtMs:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp(),loyaltyPointsAwarded:false},{merge:false});
+    tx.set(reservationRef,{reference:ref,reservationId:reservationRef.id,roomId:room.id,roomTypeId:room.id,roomTypeName:room.name,assignedRoomId:assignedRoom&&assignedRoom.id,assignedRoomNumber:assignedRoom&&assignedRoom.roomNumber,roomName:room.name,roomType:room.type,roomImage:room.img,destination:room.destination,location:room.location,guestUid:currentUser().uid,userId:currentUser().uid,guestName:guestInfo.name,leadGuest:guestInfo.name,guestEmail:guestInfo.email,contactNumber:guestInfo.contactNumber,checkin:detail.checkin,checkIn:detail.checkin,checkout:detail.checkout,checkOut:detail.checkout,checkinTime:detail.checkinTime||"15:00",nights,guests:detail.guests,extras,roomPrice:room.price,extrasPrice,subtotal,taxes,totalPrice:total,total,status:"pending",createdAtMs:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp(),loyaltyPointsAwarded:false},{merge:false});
   });return ref;
 }
-async function enhancedHandleBook(){const room=ROOMS.find(r=>r.id===state.selectedRoomId);if(!room)return;if(!currentUser()){pendingBookingRoomId=room.id;openAuth("login");return;}try{const ref=await enhancedCreateReservation(room,state.detail,{name:state.detail.leadGuest||currentUser().displayName||"StayLink Guest",email:currentUser().email,contactNumber:state.detail.contactNumber||userProfile.phone||""});toast("Reservation confirmed · "+ref);navigate("reservations");}catch(e){state.auth.error=e.message||"Unable to create reservation.";render();}}
+async function enhancedHandleBook(){const room=ROOMS.find(r=>r.id===state.selectedRoomId);if(!room)return;if(!currentUser()){pendingBookingRoomId=room.id;openAuth("login");return;}try{const ref=await enhancedCreateReservation(room,state.detail,{name:state.detail.leadGuest||currentUser().displayName||"StayLink Guest",email:currentUser().email,contactNumber:state.detail.contactNumber||userProfile.phone||""});toast("Reservation request submitted · "+ref);navigate("reservations");}catch(e){state.auth.error=e.message||"Unable to create reservation.";render();}}
 function enhancedRenderReservationsView(){
   if(!currentUser())return `<div class="pt-32 text-center"><button onclick="openAuth('login')" class="bg-gold text-surface px-6 py-3 rounded-xl">Sign in</button></div>`;
   const today=new Date().toISOString().slice(0,10),upcoming=myReservations.filter(r=>!["cancelled","completed"].includes(normalizedStatus(r.status))&&String(r.checkout||r.checkOut)>=today),past=myReservations.filter(r=>!upcoming.includes(r));
-  const card=r=>{const room=reservationRoom(r),locked=["cancelled","completed"].includes(normalizedStatus(r.status))||String(r.checkout||r.checkOut)<today;return `<div class="rounded-xl p-3 flex gap-3" style="background:#171612;border:1px solid rgba(200,146,42,.15)"><img src="${img(r.roomImage||(room&&room.img)||"1566073771259-6a8506099945",240,160)}" class="w-28 h-20 object-cover rounded-lg" alt="${esc(r.roomName||"Room")}"><div class="flex-1"><div class="flex justify-between"><p class="font-display text-lg text-cream">${esc(r.roomName||"StayLink room")}</p><span class="text-xs text-gold uppercase">${normalizedStatus(r.status)}</span></div><p class="text-gold text-xs">${esc(r.destination||"Manila")} · ${formatDate(r.checkin||r.checkIn)} – ${formatDate(r.checkout||r.checkOut)}</p><p class="text-dim text-xs mt-1">${r.guests||1} Guests · ${money(r.total||r.totalPrice)}</p><div class="flex gap-2 mt-2"><button onclick="openStayDetails('${r.id}')" class="text-[11px] text-gold">Check-in Details</button>${!locked?`<button onclick="openCancellation('${r.id}')" class="text-[11px] text-red-300">Cancel</button>`:""}</div></div></div>`};
+  const card=r=>{const room=reservationRoom(r),locked=["cancelled","completed","checked-in","checked-out"].includes(normalizedStatus(r.status))||String(r.checkout||r.checkOut)<today;return `<div class="rounded-xl p-3 flex gap-3" style="background:#171612;border:1px solid rgba(200,146,42,.15)"><img src="${img(r.roomImage||(room&&room.img)||"1566073771259-6a8506099945",240,160)}" class="w-28 h-20 object-cover rounded-lg" alt="${esc(r.roomName||"Room")}"><div class="flex-1"><div class="flex justify-between"><p class="font-display text-lg text-cream">${esc(r.roomName||"StayLink room")}</p><span class="text-xs text-gold uppercase">${normalizedStatus(r.status)}</span></div><p class="text-gold text-xs">${esc(r.destination||"Manila")} · ${formatDate(r.checkin||r.checkIn)} – ${formatDate(r.checkout||r.checkOut)}</p><p class="text-dim text-xs mt-1">${r.guests||1} Guests · ${money(r.total||r.totalPrice)}</p><div class="flex gap-2 mt-2"><button onclick="openStayDetails('${r.id}')" class="text-[11px] text-gold">Check-in Details</button>${!locked?`<button onclick="openCancellation('${r.id}')" class="text-[11px] text-red-300">Cancel</button>`:""}</div></div></div>`};
   return `<div class="pt-24 pb-28 px-6 max-w-3xl mx-auto"><h2 class="font-display text-4xl text-cream mb-8">My Stays</h2>${upcoming.length?`<h3 class="text-xs text-dim uppercase mb-3">Upcoming</h3><div class="space-y-3 mb-8">${upcoming.map(card).join("")}</div>`:""}${past.length?`<h3 class="text-xs text-dim uppercase mb-3">Completed &amp; cancelled</h3><div class="space-y-3">${past.map(card).join("")}</div>`:""}${!myReservations.length?`<p class="text-dim text-center py-16">No reservations yet.</p>`:""}</div>`;
 }
-async function enhancedConfirmCancellation(){const item=myReservations.find(r=>r.id===state.cancel.id);if(!item||state.cancel.loading)return;state.cancel.loading=true;try{await db.collection("reservations").doc(item.id).update({status:"cancelled",cancellationReason:state.cancel.reason==="Other"?state.cancel.other:state.cancel.reason,cancelledAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});const room=reservationRoom(item);if(room)await db.collection("rooms").doc(String(room.id)).set({availabilityCount:firebase.firestore.FieldValue.increment(1),status:"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});await releasePhysicalBooking(item);state.cancel=null;toast("Reservation Cancelled.");}catch(e){state.cancel.error=e.message||"Cancellation failed.";state.cancel.loading=false;render();}}
+async function enhancedConfirmCancellation(){const item=myReservations.find(r=>r.id===state.cancel.id);if(!item||state.cancel.loading)return;if(!["pending","confirmed"].includes(normalizedStatus(item.status))){state.cancel.error="This reservation can no longer be cancelled here.";render();return;}state.cancel.loading=true;try{await db.collection("reservations").doc(item.id).update({status:"cancelled",cancellationReason:state.cancel.reason==="Other"?state.cancel.other:state.cancel.reason,cancelledAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});await releasePhysicalBooking(item);state.cancel=null;toast("Reservation Cancelled.");}catch(e){state.cancel.error=e.message||"Cancellation failed.";state.cancel.loading=false;render();}}
 
 function renderTopNav(){
   const links = [...NAV_LINKS];
@@ -819,14 +850,14 @@ function renderDetailView(){
     const nights=Math.max(1,Math.round((new Date(detail.checkout)-new Date(detail.checkin))/86400000));
     if(nights<1) throw new Error("Check-out must be after check-in.");
     const extras={breakfast:!!detail.breakfast,spa:!!detail.spa}, extrasPrice=(extras.breakfast?450:0)+(extras.spa?850:0), subtotal=room.price*nights, taxes=Math.round((subtotal+extrasPrice)*.12), total=subtotal+extrasPrice+taxes, ref=genReference(), reservationRef=db.collection("reservations").doc(), roomRef=db.collection("rooms").doc(String(room.id));
-    await db.runTransaction(async tx=>{ const roomSnap=await tx.get(roomRef), data=roomSnap.exists?roomSnap.data():{}, count=Number(data.availabilityCount ?? room.availability ?? 0); if(count<=0) throw new Error("This room is no longer available."); tx.set(roomRef,{availabilityCount:count-1,status:count-1===0?"Occupied":"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true}); tx.set(reservationRef,{reference:ref,reservationId:reservationRef.id,roomId:room.id,roomName:room.name,roomType:room.type,roomImage:room.img,destination:room.destination,location:room.location,guestUid:currentUser().uid,userId:currentUser().uid,guestName:guestInfo.name,leadGuest:guestInfo.name,guestEmail:guestInfo.email,contactNumber:guestInfo.contactNumber,checkin:detail.checkin,checkIn:detail.checkin,checkout:detail.checkout,checkOut:detail.checkout,checkinTime:detail.checkinTime||"15:00",nights,guests:detail.guests,extras,roomPrice:room.price,extrasPrice,subtotal,taxes,totalPrice:total,total,status:"confirmed",createdAtMs:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp(),loyaltyPointsAwarded:false},{merge:false}); });
+    await db.runTransaction(async tx=>{ const roomSnap=await tx.get(roomRef), data=roomSnap.exists?roomSnap.data():{}, count=Number(data.availabilityCount ?? room.availability ?? 0); if(count<=0) throw new Error("This room is no longer available."); tx.set(reservationRef,{reference:ref,reservationId:reservationRef.id,roomId:room.id,roomName:room.name,roomType:room.type,roomImage:room.img,destination:room.destination,location:room.location,guestUid:currentUser().uid,userId:currentUser().uid,guestName:guestInfo.name,leadGuest:guestInfo.name,guestEmail:guestInfo.email,contactNumber:guestInfo.contactNumber,checkin:detail.checkin,checkIn:detail.checkin,checkout:detail.checkout,checkOut:detail.checkout,checkinTime:detail.checkinTime||"15:00",nights,guests:detail.guests,extras,roomPrice:room.price,extrasPrice,subtotal,taxes,totalPrice:total,total,status:"pending",createdAtMs:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp(),loyaltyPointsAwarded:false},{merge:false}); });
     return ref;
   }
   async function handleBook(){
     const room=ROOMS.find(r=>r.id===state.selectedRoomId); if(!room)return;
     if(!currentUser()){pendingBookingRoomId=room.id;openAuth("login");return;}
     const btn=document.getElementById("reserve-btn"); if(btn){btn.disabled=true;btn.textContent="Confirming…";}
-    try{const ref=await createReservation(room,state.detail,{name:state.detail.leadGuest||currentUser().displayName||"StayLink Guest",email:currentUser().email,contactNumber:state.detail.contactNumber||userProfile.phone||""});toast("Reservation confirmed · "+ref);navigate("reservations");}
+    try{const ref=await createReservation(room,state.detail,{name:state.detail.leadGuest||currentUser().displayName||"StayLink Guest",email:currentUser().email,contactNumber:state.detail.contactNumber||userProfile.phone||""});toast("Reservation request submitted · "+ref);navigate("reservations");}
     catch(e){if(btn){btn.disabled=false;btn.textContent="Reserve Now";} state.auth.error=e.message||"Unable to create reservation."; render();}
   }
   function toast(message){const el=document.getElementById("toast");el.querySelector("span").textContent=message;el.classList.remove("hidden");el.classList.add("flex");setTimeout(()=>{el.classList.add("hidden");el.classList.remove("flex");},3500);}
@@ -852,7 +883,7 @@ function renderDetailView(){
     const details=state.stayDetails?myReservations.find(r=>r.id===state.stayDetails):null, cancel=state.cancel&&myReservations.find(r=>r.id===state.cancel.id);
     return `<div class="pt-24 pb-28 md:pb-10 px-6 max-w-3xl mx-auto fade-in"><p class="text-gold text-[10px] tracking-[.35em] uppercase mb-2">Your reservations</p><h2 class="font-display text-4xl text-cream mb-8">My Stays</h2>${!myReservations.length?`<div class="text-center py-20 rounded-2xl" style="border:1px dashed rgba(200,146,42,.25)"><p class="font-display text-2xl text-dim mb-3">No reservations yet</p><button onclick="navigate('rooms')" class="text-gold text-sm">Browse rooms →</button></div>`:`${upcoming.length?`<h3 class="text-cream text-xs uppercase tracking-wider mb-3">Upcoming &amp; pending</h3><div class="space-y-3 mb-8">${upcoming.map(r=>card(r,false)).join("")}</div>`:""}${past.length?`<h3 class="text-cream text-xs uppercase tracking-wider mb-3">Completed &amp; cancelled</h3><div class="space-y-3">${past.map(r=>card(r,true)).join("")}</div>`:""}`}${details?`<div class="fixed inset-0 z-[90] flex items-center justify-center p-4" style="background:rgba(11,11,9,.8)" onclick="if(event.target===this)closeStayDetails()"><div class="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-2xl p-6" style="background:#171612;border:1px solid rgba(200,146,42,.25)"><div class="flex justify-between"><h3 class="font-display text-2xl text-cream">Check-in Details</h3><button onclick="closeStayDetails()" class="text-dim">✕</button></div><p class="text-gold mt-5">StayLink ${esc(details.destination||"Manila")}</p><h4 class="text-cream text-lg mt-1">${esc(details.roomName||"Presidential Suite")} · ${esc(details.view||"Panoramic View")}</h4><div class="space-y-2 text-sm text-dim mt-5"><p>Lead Guest: <span class="text-cream">${esc(details.leadGuest||details.guestName||"Not specified")}</span></p><p>Reservation ID: <span class="text-cream">${esc(details.reservationId||details.reference||details.id)}</span></p><p>Dates: <span class="text-cream">${formatDate(details.checkin||details.checkIn)} – ${formatDate(details.checkout||details.checkOut)} (${details.nights||1} Night${Number(details.nights)===1?"":"s"})</span></p><p>Guests: <span class="text-cream">${details.guests||1} Guests</span></p><p>Times: <span class="text-cream">Check-in: ${formatTime(details.checkinTime)} | Check-out: 12:00 PM</span></p></div><p class="text-cream text-sm font-semibold mt-5">Included Extras</p><ul class="text-dim text-sm list-disc pl-5 mt-2">${details.extras&&details.extras.breakfast?"<li>Daily Breakfast</li>":""}${details.extras&&details.extras.spa?"<li>Wellness Spa Access</li>":""}${!details.extras||(!details.extras.breakfast&&!details.extras.spa)?"<li>None selected</li>":""}</ul><div class="flex gap-2 mt-6"><button onclick="toast('Digital key coming soon')" class="flex-1 text-xs text-gold py-3 rounded-lg" style="border:1px solid rgba(200,146,42,.3)">View Digital Key / QR Code</button><button onclick="toast('Concierge contact coming soon')" class="flex-1 text-xs text-gold py-3 rounded-lg" style="border:1px solid rgba(200,146,42,.3)">Contact Concierge</button></div></div></div>`:""}${cancel?`<div class="fixed inset-0 z-[90] flex items-center justify-center p-4" style="background:rgba(11,11,9,.8)"><div class="w-full max-w-md rounded-2xl p-6" style="background:#171612;border:1px solid rgba(255,69,58,.35)"><h3 class="font-display text-2xl text-cream">Cancel reservation?</h3><p class="text-dim text-sm mt-4">Free cancellation until 48 hours before check-in.</p><p class="text-dim text-sm mt-2">Cancellations made within 48 hours will incur a 1-night fee.</p><select onchange="setCancelField('reason',this.value)" class="w-full mt-5 bg-[#0B0B09] text-cream text-sm rounded-lg p-3"><option>Change of plans</option><option>Booked by mistake</option><option>Found a better option</option><option>Other</option></select>${state.cancel.reason==="Other"?`<input oninput="setCancelField('other',this.value)" placeholder="Tell us why" class="w-full mt-2 bg-[#0B0B09] text-cream text-sm rounded-lg p-3">`:""}${state.cancel.error?`<p class="text-red-400 text-xs mt-3">${esc(state.cancel.error)}</p>`:""}<div class="flex gap-3 mt-6"><button onclick="closeCancellation()" class="flex-1 text-sm text-dim py-3 rounded-lg" style="border:1px solid rgba(200,146,42,.2)">Keep Reservation</button><button onclick="confirmCancellation()" ${state.cancel.loading?"disabled":""} class="flex-1 text-sm text-white py-3 rounded-lg disabled:opacity-60" style="background:#A83232">${state.cancel.loading?"Cancelling…":"Confirm Cancellation"}</button></div></div></div>`:""}</div>`;
   }
-  async function confirmCancellation(){const item=myReservations.find(r=>r.id===state.cancel.id);if(!item||state.cancel.loading)return;state.cancel.loading=true;render();try{await db.collection("reservations").doc(item.id).update({status:"cancelled",cancellationReason:state.cancel.reason==="Other"?state.cancel.other:state.cancel.reason,cancelledAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});const room=reservationRoom(item);if(room)await db.collection("rooms").doc(String(room.id)).set({availabilityCount:firebase.firestore.FieldValue.increment(1),status:"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});state.cancel=null;toast("Reservation Cancelled.");}catch(e){state.cancel.error=e.message||"Cancellation failed.";state.cancel.loading=false;render();}}
+  async function confirmCancellation(){const item=myReservations.find(r=>r.id===state.cancel.id);if(!item||state.cancel.loading)return;if(!["pending","confirmed"].includes(normalizedStatus(item.status))){state.cancel.error="This reservation can no longer be cancelled here.";render();return;}state.cancel.loading=true;render();try{await db.collection("reservations").doc(item.id).update({status:"cancelled",cancellationReason:state.cancel.reason==="Other"?state.cancel.other:state.cancel.reason,cancelledAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});await releasePhysicalBooking(item);state.cancel=null;toast("Reservation Cancelled.");}catch(e){state.cancel.error=e.message||"Cancellation failed.";state.cancel.loading=false;render();}}
 
   return `
   <div class="pt-16 pb-28 md:pb-10 min-h-screen fade-in">
@@ -1190,7 +1221,8 @@ function adminRoomsTable(){
   </div>`;
 }
 async function adminCycleRoomStatus(roomId){
-  const cycle = { Available:"Occupied", Occupied:"Cleaning", Cleaning:"Available" };
+  if(roomStatus[roomId]==="Occupied"){toast("Check out the guest before changing this room's status.");return;}
+  const cycle = { Available:"Cleaning", Occupied:"Cleaning", Cleaning:"Available" };
   const next = cycle[roomStatus[roomId]||'Available'];
   await setRoomStatus(roomId, next);
 }
@@ -1408,9 +1440,9 @@ createReservationTransaction = async function(room,detail,guestInfo,reservationI
   const total=subtotal+extrasPrice+taxes;
   const reference=genReference();
   const reservationRef=reservationId ? db.collection("reservations").doc(reservationId) : db.collection("reservations").doc();
-  const roomRef=db.collection("rooms").doc(String(room.id));
   const physicalQuerySnap=await db.collection("rooms").where("roomTypeId","==",room.id).get();
   const physicalRefs=physicalQuerySnap.docs.map(doc=>doc.ref);
+  if (!physicalRefs.length) throw new Error("Room inventory is not initialized. Please contact hotel staff.");
   await db.runTransaction(async tx=>{
     const physicalDocs=[];
     for (const ref of physicalRefs) physicalDocs.push(await tx.get(ref));
@@ -1423,21 +1455,16 @@ createReservationTransaction = async function(room,detail,guestInfo,reservationI
         return requestedStart < end && requestedEnd > start;
       });
     });
-    const snapshot=await tx.get(roomRef);
-    const data=snapshot.exists?snapshot.data():{};
-    const count=physicalDocs.length ? availablePhysical.length : Number(data.availabilityCount??room.availability??0);
+    const count=availablePhysical.length;
     if(count<=0) throw new Error("This room is no longer available.");
     const assignedRoom=availablePhysical[0];
-    if(physicalDocs.length && !assignedRoom) throw new Error("No physical room is available for these dates.");
-    tx.set(roomRef,{availabilityCount:Math.max(0,count-1),status:count===1?"Occupied":"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
-    if(assignedRoom){
-      const assignedData=assignedRoom.data();
-      tx.update(assignedRoom.ref,{status:"Occupied",bookings:[...(assignedData.bookings||[]),{reservationId:reservationRef.id,checkin:detail.checkin,checkout:detail.checkout}],updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
-    }
+    if(!assignedRoom) throw new Error("No physical room is available for these dates.");
+    const assignedData=assignedRoom.data();
+    tx.update(assignedRoom.ref,{bookings:[...(assignedData.bookings||[]),{reservationId:reservationRef.id,checkin:detail.checkin,checkout:detail.checkout}],updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
     tx.set(reservationRef,{
       reference,reservationId:reservationRef.id,roomId:room.id,roomName:room.name,roomType:room.type,
       roomImage:room.img,destination:room.destination,location:room.location,roomTypeId:room.id,roomTypeName:room.name,
-      assignedRoomId:assignedRoom ? assignedRoom.id : null,assignedRoomNumber:assignedRoom ? assignedRoom.data().roomNumber : null,
+      assignedRoomId:assignedRoom.id,assignedRoomNumber:assignedRoom.data().roomNumber,
       guestUid:currentUser().uid,userId:currentUser().uid,guestName:guestInfo.name,leadGuest:guestInfo.name,
       guestEmail:guestInfo.email,contactNumber:guestInfo.contactNumber,checkin:detail.checkin,checkIn:detail.checkin,
       checkout:detail.checkout,checkOut:detail.checkout,checkinTime:detail.checkinTime||"15:00",
@@ -1500,7 +1527,7 @@ renderReservationsView = function(){
   const reservationCard = r => {
     const room = reservationRoom(r);
     const status = normalizedStatus(r.status);
-    const locked = ["cancelled","rejected","completed"].includes(status) || String(r.checkout || r.checkOut || "") < today;
+    const locked = ["cancelled","rejected","completed","checked-in","checked-out"].includes(status) || String(r.checkout || r.checkOut || "") < today;
     return `<div class="rounded-xl p-3 flex gap-3" style="background:#171612;border:1px solid rgba(200,146,42,.15)">
       <img src="${img(r.roomImage || (room && room.img) || "1566073771259-6a8506099945",240,160)}" alt="${esc(r.roomName || "StayLink room")}" class="w-28 h-20 object-cover rounded-lg">
       <div class="flex-1 min-w-0"><div class="flex justify-between gap-2"><p class="font-display text-lg text-cream truncate">${esc(r.roomName || "StayLink room")}</p><span class="text-xs uppercase ${status==="cancelled"?"text-red-400":"text-gold"}">${status}</span></div>
@@ -1522,7 +1549,7 @@ renderReservationsView = function(){
       </div>
       <p class="text-cream text-sm font-semibold mt-5">Included Extras:</p>
       <ul class="text-dim text-sm list-disc pl-5 mt-2"><li>Daily Breakfast</li><li>Wellness Spa Access</li></ul>
-      <div class="flex gap-3 mt-6"><button onclick="toast('Digital key coming soon')" class="flex-1 text-xs text-gold py-3 rounded-lg" style="border:1px solid rgba(200,146,42,.3)">View Digital Key / QR Code</button>${!["cancelled","completed"].includes(normalizedStatus(selected.status)) ? `<button onclick="closeStayDetails();openCancellation('${selected.id}')" class="flex-1 text-xs text-red-300 py-3 rounded-lg" style="border:1px solid rgba(255,69,58,.3)">Cancel Reservation</button>` : ""}</div>
+      <div class="flex gap-3 mt-6"><button onclick="toast('Digital key coming soon')" class="flex-1 text-xs text-gold py-3 rounded-lg" style="border:1px solid rgba(200,146,42,.3)">View Digital Key / QR Code</button>${["pending","confirmed"].includes(normalizedStatus(selected.status)) ? `<button onclick="closeStayDetails();openCancellation('${selected.id}')" class="flex-1 text-xs text-red-300 py-3 rounded-lg" style="border:1px solid rgba(255,69,58,.3)">Cancel Reservation</button>` : ""}</div>
     </div></div>` : "";
   const cancellationModal = cancellation ? `<div class="fixed inset-0 z-[100] flex items-center justify-center p-4" style="background:rgba(11,11,9,.84)">
     <div class="w-full max-w-md rounded-2xl p-6" style="background:#171612;border:1px solid rgba(255,69,58,.35)">
@@ -1549,7 +1576,11 @@ function adminRoom(room){
   const override = adminRoomOverrides[String(room.id)] || {};
   return { ...room, ...override };
 }
-function adminReservationStatus(r){ return normalizedStatus(r.status); }
+function adminReservationStatus(r){
+  const status = normalizedStatus(r.status);
+  if (status === "completed" && !r.checkedInAt && !r.checkedOutAt) return "confirmed";
+  return status;
+}
 function adminReservationCanCheckIn(r){
   return ["confirmed"].includes(adminReservationStatus(r));
 }
@@ -1557,37 +1588,110 @@ function adminReservationCanCheckOut(r){
   return ["checked-in"].includes(adminReservationStatus(r));
 }
 function adminReservationCanCancel(r){
-  return !["cancelled","rejected","checked-out","completed"].includes(adminReservationStatus(r));
+  return ["pending","confirmed"].includes(adminReservationStatus(r));
 }
 function adminReservationCanDecide(r){ return adminReservationStatus(r) === "pending"; }
 async function adminUpdateReservation(id, status){
   if (!isAdmin()) throw new Error("Staff access required.");
   const item = allReservations.find(r => r.id === id);
   if (!item) throw new Error("Reservation not found.");
+  if (status === "confirmed" && !adminReservationCanDecide(item)) throw new Error("This reservation has already been decided.");
   if (status === "rejected" && !adminReservationCanDecide(item)) throw new Error("This reservation has already been decided.");
+  if (status === "checked-in" && !adminReservationCanCheckIn(item)) throw new Error("Only an accepted reservation can be checked in.");
+  if (status === "checked-out" && !adminReservationCanCheckOut(item)) throw new Error("Only a checked-in reservation can be checked out.");
   if (status === "cancelled" && !adminReservationCanCancel(item)) throw new Error("This reservation cannot be cancelled.");
-  await db.collection("reservations").doc(id).update({
-    status,
-    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-    ...(status === "checked-in" ? { checkedInAt: firebase.firestore.FieldValue.serverTimestamp() } : {}),
-    ...(status === "checked-out" ? { checkedOutAt: firebase.firestore.FieldValue.serverTimestamp() } : {}),
-    ...(status === "rejected" ? { cancellationReason:"Rejected by hotel staff", rejectedAt:firebase.firestore.FieldValue.serverTimestamp() } : {}),
-    ...(status === "cancelled" ? { cancellationReason:"Cancelled by hotel staff", cancelledAt:firebase.firestore.FieldValue.serverTimestamp() } : {})
-  });
+  if (!["confirmed","rejected","checked-in","checked-out","cancelled"].includes(status)) throw new Error("Unsupported reservation status.");
+  const reservationRef = db.collection("reservations").doc(id);
+  if (status === "checked-in") {
+    const roomTypeId = item.roomTypeId || item.roomId;
+    if (!item.assignedRoomId || roomTypeId == null) throw new Error("This reservation has no assigned physical room.");
+    const assignedRoomRef = db.collection("rooms").doc(item.assignedRoomId);
+    const roomTypeRef = db.collection("rooms").doc(String(roomTypeId));
+    const physicalQuery = db.collection("rooms").where("roomTypeId","==",roomTypeId);
+    const physicalRoomRefs = (await physicalQuery.get()).docs.map(doc => doc.ref);
+    if (!physicalRoomRefs.some(ref => ref.id === assignedRoomRef.id)) throw new Error("The assigned room does not match this room type.");
+    await db.runTransaction(async tx => {
+      const reservationSnap = await tx.get(reservationRef);
+      const currentReservation = reservationSnap.data() || {};
+      const currentStatus = normalizedStatus(currentReservation.status);
+      const legacyAutoCompleted = currentStatus === "completed" && !currentReservation.checkedInAt && !currentReservation.checkedOutAt;
+      if (!reservationSnap.exists || (currentStatus !== "confirmed" && !legacyAutoCompleted)) {
+        throw new Error("Only an accepted reservation can be checked in.");
+      }
+      const physicalRoomSnaps = await Promise.all(physicalRoomRefs.map(ref => tx.get(ref)));
+      const assignedRoomSnap = physicalRoomSnaps.find(snap => snap.id === assignedRoomRef.id);
+      if (!assignedRoomSnap.exists) throw new Error("The assigned physical room no longer exists.");
+      const assignedRoom = assignedRoomSnap.data();
+      if ((assignedRoom.status || "Available") !== "Available") throw new Error("The assigned room is not available for check-in.");
+      const otherRooms = physicalRoomSnaps.filter(snap => snap.id !== assignedRoomSnap.id);
+      const availableAfter = otherRooms.filter(snap => (snap.data().status || "Available") === "Available").length;
+      const hasCleaningRoom = otherRooms.some(snap => snap.data().status === "Cleaning");
+      const bookings = assignedRoom.bookings || [];
+      const hasReservationBooking = bookings.some(booking => booking.reservationId === id);
+      const now = firebase.firestore.FieldValue.serverTimestamp();
+      tx.update(reservationRef,{status:"checked-in",checkedInAt:now,updatedAt:now});
+      tx.update(assignedRoomRef,{
+        status:"Occupied",
+        occupiedReservationId:id,
+        ...(!hasReservationBooking ? {bookings:[...bookings,{reservationId:id,checkin:reservationSnap.data().checkin || reservationSnap.data().checkIn,checkout:reservationSnap.data().checkout || reservationSnap.data().checkOut}]} : {}),
+        updatedAt:now
+      });
+      tx.set(roomTypeRef,{
+        availabilityCount:availableAfter,
+        status:availableAfter > 0 ? "Available" : hasCleaningRoom ? "Cleaning" : "Occupied",
+        updatedAt:now
+      },{merge:true});
+    });
+  } else if (status === "checked-out") {
+    const roomTypeId = item.roomTypeId || item.roomId;
+    if (!item.assignedRoomId || roomTypeId == null) throw new Error("This reservation has no assigned physical room.");
+    const assignedRoomRef = db.collection("rooms").doc(item.assignedRoomId);
+    const roomTypeRef = db.collection("rooms").doc(String(roomTypeId));
+    const physicalQuery = db.collection("rooms").where("roomTypeId","==",roomTypeId);
+    const physicalRoomRefs = (await physicalQuery.get()).docs.map(doc => doc.ref);
+    if (!physicalRoomRefs.some(ref => ref.id === assignedRoomRef.id)) throw new Error("The assigned room does not match this room type.");
+    await db.runTransaction(async tx => {
+      const reservationSnap = await tx.get(reservationRef);
+      if (!reservationSnap.exists || normalizedStatus(reservationSnap.data().status) !== "checked-in") {
+        throw new Error("Only a checked-in reservation can be checked out.");
+      }
+      const physicalRoomSnaps = await Promise.all(physicalRoomRefs.map(ref => tx.get(ref)));
+      const assignedRoomSnap = physicalRoomSnaps.find(snap => snap.id === assignedRoomRef.id);
+      if (!assignedRoomSnap.exists) throw new Error("The assigned physical room no longer exists.");
+      const assignedRoom = assignedRoomSnap.data();
+      if (assignedRoom.status !== "Occupied" || (assignedRoom.occupiedReservationId && assignedRoom.occupiedReservationId !== id)) {
+        throw new Error("The assigned room is not occupied by this reservation.");
+      }
+      const bookings = assignedRoom.bookings || [];
+      const availableCount = physicalRoomSnaps.filter(snap =>
+        snap.id !== assignedRoomSnap.id && (snap.data().status || "Available") === "Available"
+      ).length;
+      const now = firebase.firestore.FieldValue.serverTimestamp();
+      tx.update(reservationRef,{status:"checked-out",checkedOutAt:now,updatedAt:now});
+      tx.update(assignedRoomRef,{
+        status:"Cleaning",
+        occupiedReservationId:firebase.firestore.FieldValue.delete(),
+        bookings:bookings.filter(booking => booking.reservationId !== id),
+        updatedAt:now
+      });
+      tx.set(roomTypeRef,{
+        availabilityCount:availableCount,
+        status:availableCount > 0 ? "Available" : "Cleaning",
+        updatedAt:now
+      },{merge:true});
+    });
+  } else {
+    await reservationRef.update({
+      status,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      ...(status === "rejected" ? { cancellationReason:"Rejected by hotel staff", rejectedAt:firebase.firestore.FieldValue.serverTimestamp() } : {}),
+      ...(status === "cancelled" ? { cancellationReason:"Cancelled by hotel staff", cancelledAt:firebase.firestore.FieldValue.serverTimestamp() } : {})
+    });
+  }
   if (status === "rejected" || status === "cancelled") {
-    const room = reservationRoom(item);
-    if (room) await db.collection("rooms").doc(String(room.id)).set({
-      availabilityCount: firebase.firestore.FieldValue.increment(1),
-      status:"Available",
-      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-    }, { merge:true });
     await releasePhysicalBooking(item);
   }
-  if (status === "checked-out") {
-    await releasePhysicalBooking(item);
-    await syncRoomTypeSummary(item.roomTypeId || item.roomId);
-  }
-  toast(status === "rejected" ? "Reservation rejected and room released." : status === "cancelled" ? "Booking cancelled and room released." : `Booking marked ${adminStatusLabels[status] || status}.`);
+  toast(status === "rejected" ? "Reservation rejected." : status === "cancelled" ? "Booking cancelled." : status === "checked-out" ? "Guest checked out. Room moved to Cleaning." : `Booking marked ${adminStatusLabels[status] || status}.`);
 }
 async function adminChangeReservation(id, status){
   try { await adminUpdateReservation(id, status); }
@@ -1615,11 +1719,15 @@ async function releasePhysicalBooking(item){
     const snap = await tx.get(ref);
     if (!snap.exists) return;
     const data = snap.data() || {};
-    tx.update(ref, {
-      status: "Available",
+    const patch = {
       bookings: (data.bookings || []).filter(booking => booking.reservationId !== item.id),
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-    });
+    };
+    if (normalizedStatus(item.status) === "checked-in" || data.occupiedReservationId === item.id) {
+      patch.status = "Available";
+      patch.occupiedReservationId = firebase.firestore.FieldValue.delete();
+    }
+    tx.update(ref, patch);
   });
   if (item.roomTypeId != null) await syncRoomTypeSummary(item.roomTypeId);
 }
@@ -1630,31 +1738,37 @@ function closeAdminGuest(){ state.admin.guestId = null; render(); }
 function renderAdminReservationModal(item){
   if (!item) return "";
   const extras = item.extras || {};
+  const room = reservationRoom(item);
+  const checkin = item.checkin || item.checkIn;
+  const checkout = item.checkout || item.checkOut;
+  const nights = Number(item.nights) || Math.max(1,Math.round((new Date(`${checkout}T00:00:00`) - new Date(`${checkin}T00:00:00`)) / 86400000));
+  const includedExtras = [extras.breakfast && "Daily Breakfast",extras.spa && "Wellness Spa Access"].filter(Boolean);
   return `<div class="fixed inset-0 z-[90] flex items-center justify-center p-4" style="background:rgba(11,11,9,.84)" onclick="if(event.target===this)closeAdminReservation()">
     <div class="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-2xl p-6" style="background:#171612;border:1px solid rgba(200,146,42,.25)">
-      <div class="flex justify-between items-start gap-4"><div><p class="text-gold text-xs uppercase tracking-wider">Reservation details</p><h3 class="font-display text-2xl text-cream mt-2">${esc(item.guestName || item.leadGuest || "Guest")}</h3></div><button onclick="closeAdminReservation()" class="text-dim">✕</button></div>
-      <div class="grid grid-cols-2 gap-3 mt-6 text-sm"><div><p class="text-dim text-xs">Email</p><p class="text-cream mt-1">${esc(item.guestEmail || "Not specified")}</p></div><div><p class="text-dim text-xs">Guests</p><p class="text-cream mt-1">${item.guests || 1}</p></div><div><p class="text-dim text-xs">Room</p><p class="text-cream mt-1">${esc(item.roomName || "Room")}</p></div><div><p class="text-dim text-xs">Total</p><p class="text-gold mt-1">${money(item.total || item.totalPrice)}</p></div><div><p class="text-dim text-xs">Dates</p><p class="text-cream mt-1">${adminDate(item.checkin || item.checkIn)} – ${adminDate(item.checkout || item.checkOut)}</p></div><div><p class="text-dim text-xs">Status</p><p class="mt-1" style="color:${adminStatusColors[adminReservationStatus(item)] || "#EDE8DC"}">${adminStatusLabels[adminReservationStatus(item)] || adminReservationStatus(item)}</p></div></div>
+      <div class="flex justify-between items-start gap-4"><div><p class="text-gold text-xs uppercase tracking-wider">Reservation details</p><p class="text-gold text-sm mt-5">StayLink ${esc(item.destination || (room && room.destination) || "Manila")}</p><h3 class="font-display text-2xl text-cream mt-1">${esc(item.roomName || "Room")} • ${esc(item.view || (room && room.view) || "Room view not specified")}</h3><p class="text-dim text-sm mt-2">${esc(item.guestName || item.leadGuest || "Guest")}</p></div><button onclick="closeAdminReservation()" class="text-dim">✕</button></div>
+      <div class="grid grid-cols-2 gap-3 mt-6 text-sm"><div><p class="text-dim text-xs">Email</p><p class="text-cream mt-1">${esc(item.guestEmail || "Not specified")}</p></div><div><p class="text-dim text-xs">Guests</p><p class="text-cream mt-1">${item.guests || 1} ${Number(item.guests) === 1 ? "Guest" : "Guests"}</p></div><div><p class="text-dim text-xs">Reservation ID</p><p class="text-cream mt-1 break-all">${esc(item.reservationId || item.id)}</p></div><div><p class="text-dim text-xs">Total</p><p class="text-gold mt-1">${money(item.total || item.totalPrice)}</p></div><div><p class="text-dim text-xs">Dates</p><p class="text-cream mt-1">${adminDate(checkin)} – ${adminDate(checkout)} (${nights} Night${nights === 1 ? "" : "s"})</p></div><div><p class="text-dim text-xs">Status</p><p class="mt-1" style="color:${adminStatusColors[adminReservationStatus(item)] || "#EDE8DC"}">${adminStatusLabels[adminReservationStatus(item)] || adminReservationStatus(item)}</p></div><div><p class="text-dim text-xs">Check-in</p><p class="text-cream mt-1">${formatTime(item.checkinTime, "3:00 PM")}</p></div><div><p class="text-dim text-xs">Check-out</p><p class="text-cream mt-1">${formatTime(item.checkoutTime, "12:00 PM")}</p></div></div>
       <div class="mt-5"><p class="text-dim text-xs">Special requests</p><p class="text-cream text-sm mt-1">${esc(item.specialRequests || item.notes || "None")}</p></div>
-      <p class="text-dim text-xs mt-5">Extras: <span class="text-cream">${extras.breakfast ? "Daily Breakfast" : ""}${extras.breakfast && extras.spa ? " · " : ""}${extras.spa ? "Wellness Spa Access" : (!extras.breakfast ? "None" : "")}</span></p>
-      <div class="flex flex-wrap gap-2 mt-6">${adminReservationCanDecide(item) ? `<button onclick="adminChangeReservation('${item.id}','confirmed');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Accept Reservation</button><button onclick="adminChangeReservation('${item.id}','rejected');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg text-red-300" style="border:1px solid rgba(255,69,58,.35)">Reject Reservation</button>` : ""}${adminReservationCanCheckIn(item) ? `<button onclick="adminChangeReservation('${item.id}','checked-in');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Check In</button>` : ""}${adminReservationCanCheckOut(item) ? `<button onclick="adminChangeReservation('${item.id}','checked-out');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Check Out</button>` : ""}${adminReservationCanCancel(item) ? `<button onclick="adminChangeReservation('${item.id}','cancelled');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg text-red-300" style="border:1px solid rgba(255,69,58,.35)">Cancel Booking</button>` : ""}</div>
+      <div class="mt-5"><p class="text-dim text-xs">Included Extras</p>${includedExtras.length ? `<ul class="text-cream text-sm list-disc pl-5 mt-1">${includedExtras.map(extra=>`<li>${extra}</li>`).join("")}</ul>` : `<p class="text-cream text-sm mt-1">None</p>`}</div>
+      <div class="flex flex-wrap gap-2 mt-6">${adminReservationCanDecide(item) ? `<button onclick="adminChangeReservation('${item.id}','confirmed');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Accept Reservation</button><button onclick="adminChangeReservation('${item.id}','rejected');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg text-red-300" style="border:1px solid rgba(255,69,58,.35)">Reject Reservation</button>` : ""}${adminReservationCanCheckIn(item) ? `<button onclick="adminChangeReservation('${item.id}','checked-in');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Check In Guest</button>` : ""}${adminReservationCanCheckOut(item) ? `<button onclick="adminChangeReservation('${item.id}','checked-out');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Check Out Guest</button>` : ""}${adminReservationCanCancel(item) ? `<button onclick="adminChangeReservation('${item.id}','cancelled');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg text-red-300" style="border:1px solid rgba(255,69,58,.35)">Cancel Booking</button>` : ""}</div>
     </div></div>`;
 }
 function adminReservationsTable(list){
   if (!list.length) return `<div class="text-center py-16 rounded-xl" style="border:1px dashed rgba(200,146,42,.2);"><p class="text-dim">No bookings match this view.</p></div>`;
-  return `<div class="rounded-xl overflow-x-auto" style="border:1px solid rgba(200,146,42,.15);"><table class="w-full text-sm min-w-[850px]"><thead><tr style="background:#171612;border-bottom:1px solid rgba(200,146,42,.15);">${["Guest / Email","Room","Dates","Total","Status","Actions"].map(h=>`<th class="text-left px-4 py-3 text-dim text-[11px] uppercase tracking-wider font-medium">${h}</th>`).join("")}</tr></thead><tbody>${list.map(r=>{const s=adminReservationStatus(r), color=adminStatusColors[s]||"#EDE8DC";return `<tr style="border-bottom:1px solid rgba(200,146,42,.08);"><td class="px-4 py-3 text-cream">${esc(r.guestName||r.leadGuest||"Guest")}<div class="text-dim text-[11px]">${esc(r.guestEmail||"")}</div></td><td class="px-4 py-3 text-dim">${esc(r.roomName||"Room")}<div class="text-gold text-[11px]">${esc(r.assignedRoomNumber||"Room not assigned")}</div></td><td class="px-4 py-3 text-dim">${adminDate(r.checkin||r.checkIn)}<br>– ${adminDate(r.checkout||r.checkOut)}</td><td class="px-4 py-3 text-cream">${money(r.total||r.totalPrice)}</td><td class="px-4 py-3"><span class="text-[11px]" style="color:${color}">${adminStatusLabels[s]||s}</span></td><td class="px-4 py-3"><div class="flex flex-wrap gap-2"><button onclick="openAdminReservation('${r.id}')" class="text-[11px] text-gold">View Details</button>${adminReservationCanDecide(r)?`<button onclick="adminChangeReservation('${r.id}','confirmed')" class="text-[11px] text-green-300">Accept</button><button onclick="adminChangeReservation('${r.id}','rejected')" class="text-[11px] text-red-300">Reject</button>`:""}${adminReservationCanCheckIn(r)?`<button onclick="adminChangeReservation('${r.id}','checked-in')" class="text-[11px] text-dim">Check-In</button>`:""}${adminReservationCanCheckOut(r)?`<button onclick="adminChangeReservation('${r.id}','checked-out')" class="text-[11px] text-dim">Check-Out</button>`:""}${adminReservationCanCancel(r)?`<button onclick="adminChangeReservation('${r.id}','cancelled')" class="text-[11px] text-red-300">Cancel</button>`:""}</div></td></tr>`;}).join("")}</tbody></table></div>`;
+  return `<div class="rounded-xl overflow-x-auto" style="border:1px solid rgba(200,146,42,.15);"><table class="w-full text-sm min-w-[850px]"><thead><tr style="background:#171612;border-bottom:1px solid rgba(200,146,42,.15);">${["Guest / Email","Room","Dates","Total","Status","Actions"].map(h=>`<th class="text-left px-4 py-3 text-dim text-[11px] uppercase tracking-wider font-medium">${h}</th>`).join("")}</tr></thead><tbody>${list.map(r=>{const s=adminReservationStatus(r), color=adminStatusColors[s]||"#EDE8DC";return `<tr style="border-bottom:1px solid rgba(200,146,42,.08);"><td class="px-4 py-3 text-cream">${esc(r.guestName||r.leadGuest||"Guest")}<div class="text-dim text-[11px]">${esc(r.guestEmail||"")}</div></td><td class="px-4 py-3 text-dim">${esc(r.roomName||"Room")}<div class="text-gold text-[11px]">${esc(r.assignedRoomNumber||"Room not assigned")}</div></td><td class="px-4 py-3 text-dim">${adminDate(r.checkin||r.checkIn)}<br>– ${adminDate(r.checkout||r.checkOut)}</td><td class="px-4 py-3 text-cream">${money(r.total||r.totalPrice)}</td><td class="px-4 py-3"><span class="text-[11px]" style="color:${color}">${adminStatusLabels[s]||s}</span></td><td class="px-4 py-3"><div class="flex flex-wrap gap-2"><button onclick="openAdminReservation('${r.id}')" class="text-[11px] text-gold">View Details</button>${adminReservationCanDecide(r)?`<button onclick="adminChangeReservation('${r.id}','confirmed')" class="text-[11px] text-green-300">Accept</button><button onclick="adminChangeReservation('${r.id}','rejected')" class="text-[11px] text-red-300">Reject</button>`:""}${adminReservationCanCheckIn(r)?`<button onclick="adminChangeReservation('${r.id}','checked-in')" class="text-[11px] text-dim">Check In</button>`:""}${adminReservationCanCheckOut(r)?`<button onclick="adminChangeReservation('${r.id}','checked-out')" class="text-[11px] text-dim">Check Out</button>`:""}${adminReservationCanCancel(r)?`<button onclick="adminChangeReservation('${r.id}','cancelled')" class="text-[11px] text-red-300">Cancel</button>`:""}</div></td></tr>`;}).join("")}</tbody></table></div>`;
 }
 function adminRoomsPanel(){
   const selectedType = ROOMS.find(room => String(room.id) === String(state.admin.roomTypeId)) || ROOMS[0];
   const rooms = roomTypePhysicalRooms(selectedType.id);
   const color = status => status==="Available" ? "#34C759" : status==="Occupied" ? "#FF453A" : "#E8B84B";
-  return `<div class="rounded-xl p-5 mb-6" style="background:#171612;border:1px solid rgba(200,146,42,.15)"><label class="text-dim text-xs uppercase tracking-wider">Room type<select onchange="setAdminRoomType(this.value)" class="block w-full md:w-96 mt-2 bg-[#0B0B09] text-cream rounded-lg p-3 outline-none">${ROOMS.map(room=>`<option value="${room.id}" ${String(room.id)===String(selectedType.id)?"selected":""}>${esc(room.name)}</option>`).join("")}</select></label><p class="text-dim text-sm mt-4">Physical rooms for ${esc(selectedType.name)}. Change each room's operational status using its dropdown.</p></div><div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">${rooms.map(item=>{const status=item.status||"Available";return `<div class="rounded-xl p-5" style="background:#171612;border:1px solid ${color(status)}55"><div class="flex justify-between items-center"><span class="font-display text-xl text-cream">${esc(item.roomNumber)}</span><span class="text-xs" style="color:${color(status)}">● ${status}</span></div><label class="block text-dim text-xs mt-4">Room status<select onchange="adminSetPhysicalRoomStatus('${item.id}',this.value)" class="w-full mt-2 bg-[#0B0B09] text-cream text-sm rounded-lg p-2.5 outline-none">${["Available","Occupied","Cleaning"].map(option=>`<option ${status===option?"selected":""}>${option}</option>`).join("")}</select></label><p class="text-dim text-xs mt-3">${status==="Available"?"Ready to assign":"Operational status"}</p></div>`;}).join("")}</div>`;
+  return `<div class="rounded-xl p-5 mb-6" style="background:#171612;border:1px solid rgba(200,146,42,.15)"><label class="text-dim text-xs uppercase tracking-wider">Room type<select onchange="setAdminRoomType(this.value)" class="block w-full md:w-96 mt-2 bg-[#0B0B09] text-cream rounded-lg p-3 outline-none">${ROOMS.map(room=>`<option value="${room.id}" ${String(room.id)===String(selectedType.id)?"selected":""}>${esc(room.name)}</option>`).join("")}</select></label><p class="text-dim text-sm mt-4">Physical rooms for ${esc(selectedType.name)}. Occupied status is set automatically when an accepted reservation is checked in; use the dropdown only for Available or Cleaning.</p></div><div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">${rooms.map(item=>{const status=item.status||"Available";return `<div class="rounded-xl p-5" style="background:#171612;border:1px solid ${color(status)}55"><div class="flex justify-between items-center"><span class="font-display text-xl text-cream">${esc(item.roomNumber)}</span><span class="text-xs" style="color:${color(status)}">● ${status}</span></div><label class="block text-dim text-xs mt-4">Room status<select ${status==="Occupied"?"disabled":""} onchange="adminSetPhysicalRoomStatus('${item.id}',this.value)" class="w-full mt-2 bg-[#0B0B09] text-cream text-sm rounded-lg p-2.5 outline-none disabled:opacity-70">${status==="Occupied"?'<option selected disabled>Occupied</option>':""}${["Available","Cleaning"].map(option=>`<option ${status===option?"selected":""}>${option}</option>`).join("")}</select></label><p class="text-dim text-xs mt-3">${status==="Available"?"Ready to assign":status==="Occupied"?"Checked-in guest":"Operational status"}</p></div>`;}).join("")}</div>`;
 }
 async function adminSetPhysicalRoomStatus(roomId, next){
   const item=physicalRooms.find(room=>room.id===roomId);
   if(!item)return;
   if(!next)return;
+  if((item.status||"Available")==="Occupied"){toast("Check out the guest before changing this room's status.");return;}
   const status=String(next);
-  if(!["Available","Occupied","Cleaning"].includes(status)){toast("Choose Available, Occupied, or Cleaning.");return;}
+  if(!["Available","Cleaning"].includes(status)){toast("Occupied status is set when an accepted reservation is checked in.");return;}
   try{await db.collection("rooms").doc(roomId).set({status,updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});toast(`${item.roomNumber} marked ${status}.`);}catch(e){toast(e.message||"Unable to update room status.");}
 }
 function adminGuestProfileModal(user){
@@ -1726,7 +1840,7 @@ function initApp(){
         if (isAdmin()) {
           attachAllReservationsListener();
           attachAllUsersListener();
-          ensurePhysicalRooms().catch(error => console.warn("physical room setup error:", error));
+          ensurePhysicalRooms().then(reconcilePhysicalRoomOccupancy).catch(error => console.warn("physical room setup error:", error));
           state.view = "admin";
         }
       } else {
