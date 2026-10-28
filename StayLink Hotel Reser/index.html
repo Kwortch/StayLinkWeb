@@ -159,6 +159,8 @@ let fbReady = false, auth = null, db = null;
    a real read/write backend for the transactional data. */
 const roomStatus = {}; // { [roomId]: "Available" | "Occupied" | "Cleaning" }
 ROOMS.forEach(r => roomStatus[r.id] = "Available");
+const physicalRooms = [];
+const adminRoomOverrides = {};
 
 let myReservations = [];   // reservations belonging to the signed-in guest
 let allReservations = [];  // every reservation (admin only)
@@ -174,18 +176,89 @@ function isAdmin(){
 function genReference(){
   return "SL-" + Math.floor(100000 + Math.random()*899999);
 }
+function physicalRoomPrefix(roomName){
+  return String(roomName || "").replace(/\bRoom\b/gi, "").trim().split(/\s+/).filter(Boolean).map(word => word.charAt(0).toUpperCase()).join("");
+}
+function physicalRoomId(roomTypeId, number){ return `physical-${roomTypeId}-${number}`; }
+function roomTypePhysicalRooms(roomTypeId){
+  return physicalRooms.filter(room => String(room.roomTypeId) === String(roomTypeId));
+}
+async function ensurePhysicalRooms(){
+  if (!fbReady || !isAdmin()) return;
+  const existingSnapshots = await Promise.all(ROOMS.map(room =>
+    db.collection("rooms").where("roomTypeId", "==", room.id).get()
+  ));
+  const batch = db.batch();
+  let writes = 0;
+  ROOMS.forEach((room, roomIndex) => {
+    const prefix = physicalRoomPrefix(room.name);
+    const existingIds = new Set(existingSnapshots[roomIndex].docs.map(doc => doc.id));
+    for (let number = 1; number <= 5; number++) {
+      const id = physicalRoomId(room.id, number);
+      if (existingIds.has(id)) continue;
+      batch.set(db.collection("rooms").doc(id), {
+        roomTypeId: room.id,
+        roomTypeName: room.name,
+        roomNumber: `${prefix}-${number}`,
+        status: "Available",
+        bookings: [],
+        visible: true,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+      }, { merge:true });
+      writes++;
+    }
+  });
+  if (writes) await batch.commit();
+}
+async function syncRoomTypeSummaries(){
+  if (!fbReady || !isAdmin() || !physicalRooms.length) return;
+  const batch = db.batch();
+  let writes = 0;
+  ROOMS.forEach(room => {
+    const physical = roomTypePhysicalRooms(room.id);
+    if (!physical.length) return;
+    const available = physical.filter(item => (item.status || "Available") === "Available").length;
+    const status = available > 0 ? "Available" : (physical.some(item => item.status === "Cleaning") ? "Cleaning" : "Occupied");
+    const currentCount = Number(roomStatus[room.id+"_count"]);
+    if (currentCount === available && roomStatus[room.id] === status) return;
+    batch.set(db.collection("rooms").doc(String(room.id)), {
+      availabilityCount: available,
+      status,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge:true });
+    writes++;
+  });
+  if (writes) await batch.commit();
+}
+async function syncRoomTypeSummary(roomTypeId){
+  if (!fbReady || !isAdmin()) return;
+  const physical = roomTypePhysicalRooms(roomTypeId);
+  if (!physical.length) return;
+  const available = physical.filter(item => (item.status || "Available") === "Available").length;
+  await db.collection("rooms").doc(String(roomTypeId)).set({
+    availabilityCount: available,
+    status: available > 0 ? "Available" : (physical.some(item => item.status === "Cleaning") ? "Cleaning" : "Occupied"),
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  }, { merge:true });
+}
 
 /* ---- Firestore listeners (live-updating, so the dashboard reflects reality) ---- */
 function attachRoomStatusListener(){
   if (!fbReady) return;
   db.collection("rooms").onSnapshot(snap => {
+    physicalRooms.length = 0;
     snap.forEach(doc => {
-      roomStatus[doc.id] = doc.data().status || "Available";
+      const data = doc.data();
+      roomStatus[doc.id] = data.status || "Available";
       if (doc.data().availabilityCount != null) roomStatus[doc.id+"_count"] = doc.data().availabilityCount;
-      if (doc.data().price != null || doc.data().visible != null) {
-        adminRoomOverrides[doc.id] = { ...(adminRoomOverrides[doc.id] || {}), ...doc.data() };
+      if (data.roomTypeId != null && data.roomNumber) {
+        physicalRooms.push({ id:doc.id, ...data });
+      }
+      if (data.price != null || data.visible != null) {
+        adminRoomOverrides[doc.id] = { ...(adminRoomOverrides[doc.id] || {}), ...data };
       }
     });
+    syncRoomTypeSummaries().catch(error => console.warn("room summary sync error:", error));
     render();
   }, err => console.warn("rooms listener error:", err));
 }
@@ -300,13 +373,15 @@ const state = {
   rooms: { activeType: "All", sortBy: "rating" },
   detail: { checkin: "2026-08-15", checkout: "2026-08-19", guests: 2, tab: "overview" },
   auth: { open:false, mode:"login", name:"", email:"", password:"", error:"", loading:false },
-  admin: { section: "overview" },
+  admin: { section: "overview", guestId: null, roomTypeId: null },
 };
 state.rooms.destination = "All destinations";
 state.searchSubmitted = false;
 state.promiseOpen = null;
 state.stayDetails = null;
 state.cancel = null;
+state.rooms.search = "";
+state.rooms.searchDraft = "";
 
 /* ============================= NAV ============================= */
 const NAV_LINKS = [["search","Discover"],["rooms","Rooms"],["reservations","My Stays"]];
@@ -432,7 +507,31 @@ async function enhancedCreateReservation(room,detail,guestInfo){
   if(!fbReady||!currentUser())throw new Error("Please sign in before booking.");
   const nights=Math.max(1,Math.round((new Date(detail.checkout)-new Date(detail.checkin))/86400000));if(nights<1)throw new Error("Check-out must be after check-in.");
   const extras={breakfast:!!detail.breakfast,spa:!!detail.spa},extrasPrice=(extras.breakfast?450:0)+(extras.spa?850:0),subtotal=room.price*nights,taxes=Math.round((subtotal+extrasPrice)*.12),total=subtotal+extrasPrice+taxes,ref=genReference(),reservationRef=db.collection("reservations").doc(),roomRef=db.collection("rooms").doc(String(room.id));
-  await db.runTransaction(async tx=>{const snap=await tx.get(roomRef),data=snap.exists?snap.data():{},count=Number(data.availabilityCount??room.availability??0);if(count<=0)throw new Error("This room is no longer available.");tx.set(roomRef,{availabilityCount:count-1,status:count===1?"Occupied":"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});tx.set(reservationRef,{reference:ref,reservationId:reservationRef.id,roomId:room.id,roomName:room.name,roomType:room.type,roomImage:room.img,destination:room.destination,location:room.location,guestUid:currentUser().uid,userId:currentUser().uid,guestName:guestInfo.name,leadGuest:guestInfo.name,guestEmail:guestInfo.email,contactNumber:guestInfo.contactNumber,checkin:detail.checkin,checkIn:detail.checkin,checkout:detail.checkout,checkOut:detail.checkout,checkinTime:detail.checkinTime||"15:00",nights,guests:detail.guests,extras,roomPrice:room.price,extrasPrice,subtotal,taxes,totalPrice:total,total,status:"confirmed",createdAtMs:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp(),loyaltyPointsAwarded:false},{merge:false});});return ref;
+  await db.runTransaction(async tx=>{
+    let assignedRoom=null;
+    const physicalQuery=db.collection("rooms").where("roomTypeId","==",room.id);
+    const physicalSnap=await tx.get(physicalQuery);
+    const physicalAvailable=physicalSnap.docs.filter(doc => (doc.data().status || "Available") === "Available");
+    const snap=await tx.get(roomRef),data=snap.exists?snap.data():{},count=physicalSnap.size ? physicalAvailable.length : Number(data.availabilityCount??room.availability??0);
+    if(count<=0)throw new Error("Only 0 rooms left at this price.");
+    const requestedStart=new Date(`${detail.checkin}T00:00:00`).getTime(), requestedEnd=new Date(`${detail.checkout}T00:00:00`).getTime();
+    for(const physicalDoc of physicalAvailable){
+      const physicalData=physicalDoc.data();
+      if((physicalData.status||"Available")!=="Available")continue;
+      const occupied=(physicalData.bookings||[]).some(item=>{
+        const start=new Date(`${item.checkin}T00:00:00`).getTime(), end=new Date(`${item.checkout}T00:00:00`).getTime();
+        return requestedStart<end && requestedEnd>start;
+      });
+      if(!occupied){assignedRoom={id:physicalDoc.id,...physicalData};break;}
+    }
+    if(!assignedRoom && physicalSnap.size)throw new Error(`Only ${count} room${count===1?"":"s"} left at this price.`);
+    tx.set(roomRef,{availabilityCount:Math.max(0,count-1),status:count===1?"Occupied":"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+    if(assignedRoom){
+      const assignedRef=db.collection("rooms").doc(assignedRoom.id);
+      tx.update(assignedRef,{status:"Occupied",bookings:[...(assignedRoom.bookings||[]),{reservationId:reservationRef.id,checkin:detail.checkin,checkout:detail.checkout}],updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+    }
+    tx.set(reservationRef,{reference:ref,reservationId:reservationRef.id,roomId:room.id,roomTypeId:room.id,roomTypeName:room.name,assignedRoomId:assignedRoom&&assignedRoom.id,assignedRoomNumber:assignedRoom&&assignedRoom.roomNumber,roomName:room.name,roomType:room.type,roomImage:room.img,destination:room.destination,location:room.location,guestUid:currentUser().uid,userId:currentUser().uid,guestName:guestInfo.name,leadGuest:guestInfo.name,guestEmail:guestInfo.email,contactNumber:guestInfo.contactNumber,checkin:detail.checkin,checkIn:detail.checkin,checkout:detail.checkout,checkOut:detail.checkout,checkinTime:detail.checkinTime||"15:00",nights,guests:detail.guests,extras,roomPrice:room.price,extrasPrice,subtotal,taxes,totalPrice:total,total,status:"confirmed",createdAtMs:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp(),loyaltyPointsAwarded:false},{merge:false});
+  });return ref;
 }
 async function enhancedHandleBook(){const room=ROOMS.find(r=>r.id===state.selectedRoomId);if(!room)return;if(!currentUser()){pendingBookingRoomId=room.id;openAuth("login");return;}try{const ref=await enhancedCreateReservation(room,state.detail,{name:state.detail.leadGuest||currentUser().displayName||"StayLink Guest",email:currentUser().email,contactNumber:state.detail.contactNumber||userProfile.phone||""});toast("Reservation confirmed · "+ref);navigate("reservations");}catch(e){state.auth.error=e.message||"Unable to create reservation.";render();}}
 function enhancedRenderReservationsView(){
@@ -441,7 +540,7 @@ function enhancedRenderReservationsView(){
   const card=r=>{const room=reservationRoom(r),locked=["cancelled","completed"].includes(normalizedStatus(r.status))||String(r.checkout||r.checkOut)<today;return `<div class="rounded-xl p-3 flex gap-3" style="background:#171612;border:1px solid rgba(200,146,42,.15)"><img src="${img(r.roomImage||(room&&room.img)||"1566073771259-6a8506099945",240,160)}" class="w-28 h-20 object-cover rounded-lg" alt="${esc(r.roomName||"Room")}"><div class="flex-1"><div class="flex justify-between"><p class="font-display text-lg text-cream">${esc(r.roomName||"StayLink room")}</p><span class="text-xs text-gold uppercase">${normalizedStatus(r.status)}</span></div><p class="text-gold text-xs">${esc(r.destination||"Manila")} · ${formatDate(r.checkin||r.checkIn)} – ${formatDate(r.checkout||r.checkOut)}</p><p class="text-dim text-xs mt-1">${r.guests||1} Guests · ${money(r.total||r.totalPrice)}</p><div class="flex gap-2 mt-2"><button onclick="openStayDetails('${r.id}')" class="text-[11px] text-gold">Check-in Details</button>${!locked?`<button onclick="openCancellation('${r.id}')" class="text-[11px] text-red-300">Cancel</button>`:""}</div></div></div>`};
   return `<div class="pt-24 pb-28 px-6 max-w-3xl mx-auto"><h2 class="font-display text-4xl text-cream mb-8">My Stays</h2>${upcoming.length?`<h3 class="text-xs text-dim uppercase mb-3">Upcoming</h3><div class="space-y-3 mb-8">${upcoming.map(card).join("")}</div>`:""}${past.length?`<h3 class="text-xs text-dim uppercase mb-3">Completed &amp; cancelled</h3><div class="space-y-3">${past.map(card).join("")}</div>`:""}${!myReservations.length?`<p class="text-dim text-center py-16">No reservations yet.</p>`:""}</div>`;
 }
-async function enhancedConfirmCancellation(){const item=myReservations.find(r=>r.id===state.cancel.id);if(!item||state.cancel.loading)return;state.cancel.loading=true;try{await db.collection("reservations").doc(item.id).update({status:"cancelled",cancellationReason:state.cancel.reason==="Other"?state.cancel.other:state.cancel.reason,cancelledAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});const room=reservationRoom(item);if(room)await db.collection("rooms").doc(String(room.id)).set({availabilityCount:firebase.firestore.FieldValue.increment(1),status:"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});state.cancel=null;toast("Reservation Cancelled.");}catch(e){state.cancel.error=e.message||"Cancellation failed.";state.cancel.loading=false;render();}}
+async function enhancedConfirmCancellation(){const item=myReservations.find(r=>r.id===state.cancel.id);if(!item||state.cancel.loading)return;state.cancel.loading=true;try{await db.collection("reservations").doc(item.id).update({status:"cancelled",cancellationReason:state.cancel.reason==="Other"?state.cancel.other:state.cancel.reason,cancelledAt:firebase.firestore.FieldValue.serverTimestamp(),updatedAt:firebase.firestore.FieldValue.serverTimestamp()});const room=reservationRoom(item);if(room)await db.collection("rooms").doc(String(room.id)).set({availabilityCount:firebase.firestore.FieldValue.increment(1),status:"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});await releasePhysicalBooking(item);state.cancel=null;toast("Reservation Cancelled.");}catch(e){state.cancel.error=e.message||"Cancellation failed.";state.cancel.loading=false;render();}}
 
 function renderTopNav(){
   const links = [...NAV_LINKS];
@@ -1143,11 +1242,15 @@ function tierIndex(tier){ return Math.max(0, TIERS.findIndex(t=>t.name===tier));
 function formatDate(value){ if (!value) return "Not specified"; const d = new Date(value+"T00:00:00"); return Number.isNaN(d.getTime()) ? value : d.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
 function formatTime(value, fallback="3:00 PM"){ if (!value) return fallback; const [h,m] = String(value).split(":"); if (m===undefined) return value; const d = new Date(); d.setHours(Number(h),Number(m),0,0); return d.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"}); }
 function availableCount(room){
+  const physical = roomTypePhysicalRooms(room.id);
+  if (physical.length) return physical.filter(item => (item.status || "Available") === "Available").length;
   const data = Number(roomStatus[room.id+"_count"]);
   return Number.isFinite(data) ? data : (roomStatus[room.id]==="Occupied" ? 0 : (room.availability || 1));
 }
 function updateDetailField(field,value){ state.detail[field]=value; render(); }
 function setRoomsDestination(value){ state.rooms.destination=value; render(); }
+function setRoomsSearchDraft(value){ state.rooms.searchDraft=value; }
+function applyRoomsSearch(){ state.rooms.search=state.rooms.searchDraft||""; render(); }
 function searchDiscoverRooms(){
   const destination = String(state.search.location || "").split(",")[0].trim();
   state.rooms.destination = destination || "All destinations";
@@ -1185,11 +1288,12 @@ function roomCardHTML(room, compact, onClickJS){
     <div class="p-5"><h3 class="font-display text-cream text-lg leading-tight mb-1.5">${esc(room.name)}</h3><p class="text-gold text-xs mb-1">${esc(room.destination)} · ${esc(room.location)}</p><p class="text-dim text-xs mb-3">${room.size} · ${esc(room.bed)} · ${esc(room.view)}</p>${!compact?`<p class="text-dim text-xs leading-relaxed mb-4 line-clamp-2">${esc(room.description)}</p>`:""}<div class="flex items-end justify-between pt-3" style="border-top:1px solid rgba(200,146,42,.1);"><div><span class="font-display text-2xl text-gold">${money(room.price)}</span><span class="text-dim text-xs ml-1">/ night</span><p class="text-[11px] ${count>0?"text-green-400":"text-red-400"}">${count>0?`${count} room${count===1?"":"s"} available`:"Sold out"}</p></div><span class="text-xs text-gold px-3 py-1.5 rounded-lg" style="border:1px solid rgba(200,146,42,.3);">View Room →</span></div></div></div>`;
 }
 function renderRoomsView(){
-  const {activeType,sortBy}=state.rooms, destination=state.rooms.destination||"All destinations";
+  const {activeType,sortBy}=state.rooms, destination=state.rooms.destination||"All destinations", search=state.rooms.search||"";
   const types=["All","Standard","Superior","Deluxe","Suite","Presidential"];
-  let filtered=ROOMS.filter(r=>(activeType==="All"||r.type===activeType)&&(destination==="All destinations"||r.destination===destination));
+  const query=search.trim().toLowerCase();
+  let filtered=ROOMS.filter(r=>(!query||`${r.name} ${r.type} ${r.destination} ${r.location}`.toLowerCase().includes(query))&&(activeType==="All"||r.type===activeType)&&(destination==="All destinations"||r.destination===destination));
   filtered.sort((a,b)=>sortBy==="price-asc"?a.price-b.price:sortBy==="price-desc"?b.price-a.price:b.rating-a.rating);
-  return `<div class="pt-24 pb-28 md:pb-10 px-6 max-w-6xl mx-auto fade-in"><div class="mb-8"><p class="text-gold text-[10px] tracking-[.35em] uppercase mb-2">StayLink destinations</p><h2 class="font-display text-4xl md:text-5xl text-cream">Rooms &amp; Suites</h2><p class="text-dim text-sm mt-2">Stay in the Philippines' most memorable destinations.</p></div><div class="flex flex-wrap gap-2.5 mb-4">${types.map(t=>`<button onclick="setRoomsType('${t}')" class="text-xs px-4 py-2 rounded-full" style="background:${activeType===t?"#C8922A":"transparent"};color:${activeType===t?"#0B0B09":"#9B9488"};border:1px solid ${activeType===t?"#C8922A":"rgba(200,146,42,.2)"};">${t}</button>`).join("")}</div><div class="flex flex-wrap gap-3 mb-8"><select onchange="setRoomsDestination(this.value)" class="text-dim text-xs px-3 py-2 rounded-lg outline-none" style="background:#171612;border:1px solid rgba(200,146,42,.2);">${DESTINATIONS.map(d=>`<option ${destination===d?"selected":""}>${d}</option>`).join("")}</select><select onchange="setRoomsSort(this.value)" class="text-dim text-xs px-3 py-2 rounded-lg outline-none" style="background:#171612;border:1px solid rgba(200,146,42,.2);"><option value="rating" ${sortBy==="rating"?"selected":""}>Top Rated</option><option value="price-asc" ${sortBy==="price-asc"?"selected":""}>Price: Low → High</option><option value="price-desc" ${sortBy==="price-desc"?"selected":""}>Price: High → Low</option></select></div>${filtered.length?`<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">${filtered.map(r=>roomCardHTML(r,false,`selectRoom(${r.id})`)).join("")}</div>`:`<div class="text-center py-20"><p class="font-display text-2xl text-dim">No rooms match this destination.</p></div>`}</div>`;
+  return `<div class="pt-24 pb-28 md:pb-10 px-6 max-w-6xl mx-auto fade-in"><div class="mb-8"><p class="text-gold text-[10px] tracking-[.35em] uppercase mb-2">StayLink destinations</p><h2 class="font-display text-4xl md:text-5xl text-cream">Rooms &amp; Suites</h2><p class="text-dim text-sm mt-2">Stay in the Philippines' most memorable destinations.</p></div><div class="flex gap-2 max-w-xl mb-5"><div class="relative flex-1"><span class="absolute left-3 top-1/2 -translate-y-1/2 text-dim">${Ico.search(17)}</span><input value="${esc(state.rooms.searchDraft||search)}" oninput="setRoomsSearchDraft(this.value)" onkeydown="if(event.key==='Enter')applyRoomsSearch()" placeholder="Search rooms by name, type, or location" class="w-full bg-[#171612] text-cream text-sm rounded-xl py-3 pl-10 pr-10 outline-none" style="border:1px solid rgba(200,146,42,.25)">${search?`<button onclick="setRoomsSearchDraft('');applyRoomsSearch()" class="absolute right-3 top-1/2 -translate-y-1/2 text-dim hover:text-cream" aria-label="Clear room search">✕</button>`:""}</div><button onclick="applyRoomsSearch()" class="px-5 rounded-xl bg-gold text-surface text-sm font-semibold">Search</button></div><div class="flex flex-wrap gap-2.5 mb-4">${types.map(t=>`<button onclick="setRoomsType('${t}')" class="text-xs px-4 py-2 rounded-full" style="background:${activeType===t?"#C8922A":"transparent"};color:${activeType===t?"#0B0B09":"#9B9488"};border:1px solid ${activeType===t?"#C8922A":"rgba(200,146,42,.2)"};">${t}</button>`).join("")}</div><div class="flex flex-wrap gap-3 mb-8"><select onchange="setRoomsDestination(this.value)" class="text-dim text-xs px-3 py-2 rounded-lg outline-none" style="background:#171612;border:1px solid rgba(200,146,42,.2);">${DESTINATIONS.map(d=>`<option ${destination===d?"selected":""}>${d}</option>`).join("")}</select><select onchange="setRoomsSort(this.value)" class="text-dim text-xs px-3 py-2 rounded-lg outline-none" style="background:#171612;border:1px solid rgba(200,146,42,.2);"><option value="rating" ${sortBy==="rating"?"selected":""}>Top Rated</option><option value="price-asc" ${sortBy==="price-asc"?"selected":""}>Price: Low → High</option><option value="price-desc" ${sortBy==="price-desc"?"selected":""}>Price: High → Low</option></select></div>${filtered.length?`<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">${filtered.map(r=>roomCardHTML(r,false,`selectRoom(${r.id})`)).join("")}</div>`:`<div class="text-center py-20"><p class="font-display text-2xl text-dim">No rooms match your search.</p><button onclick="setRoomsSearchDraft('');applyRoomsSearch()" class="text-gold text-sm mt-3">Clear search</button></div>`}</div>`;
 }
 
 function renderPromise(){
@@ -1249,7 +1353,7 @@ function renderAuthModal(){
 async function submitAuth(){
   if(!fbReady){state.auth.error="Firebase is not ready. Use Firebase Hosting or the emulator.";render();return;}
   state.auth.loading=true;state.auth.error="";render();
-  try{let credential;if(state.auth.mode==="signup"){if(!state.auth.name||!state.auth.address||!state.auth.phone)throw new Error("Full name, address, and contact number are required.");credential=await auth.createUserWithEmailAndPassword(state.auth.email.trim(),state.auth.password);await credential.user.updateProfile({displayName:state.auth.name.trim()});await db.collection("users").doc(credential.user.uid).set({fullName:state.auth.name.trim(),email:state.auth.email.trim(),address:state.auth.address.trim(),phone:state.auth.phone.trim(),loyaltyPoints:0,membership:"Bronze",vouchers:[],preferences:userProfile.preferences,createdAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});}else credential=await auth.signInWithEmailAndPassword(state.auth.email.trim(),state.auth.password);state.auth={open:false,mode:"login",name:"",email:"",password:"",error:"",loading:false};await loadUserProfile();if(pendingBookingRoomId){const id=pendingBookingRoomId;pendingBookingRoomId=null;selectRoom(id);}}catch(e){state.auth.loading=false;state.auth.error=friendlyAuthError(e);render();}
+  try{let credential;if(state.auth.mode==="signup"){if(!state.auth.name||!state.auth.address||!state.auth.phone)throw new Error("Full name, address, and contact number are required.");const email=state.auth.email.trim(),fullName=state.auth.name.trim();credential=await auth.createUserWithEmailAndPassword(email,state.auth.password);await credential.user.updateProfile({displayName:fullName});await db.collection("users").doc(credential.user.uid).set({uid:credential.user.uid,fullName,displayName:fullName,email,address:state.auth.address.trim(),phone:state.auth.phone.trim(),loyaltyPoints:0,membership:"Bronze",vouchers:[],preferences:userProfile.preferences,createdAt:firebase.firestore.FieldValue.serverTimestamp(),createdAtMs:Date.now()},{merge:true});}else credential=await auth.signInWithEmailAndPassword(state.auth.email.trim(),state.auth.password);state.auth={open:false,mode:"login",name:"",email:"",password:"",error:"",loading:false};await loadUserProfile();if(pendingBookingRoomId){const id=pendingBookingRoomId;pendingBookingRoomId=null;selectRoom(id);}}catch(e){state.auth.loading=false;state.auth.error=friendlyAuthError(e);render();}
 }
 function render(){
   renderTopNav();renderAuthModal();const root=document.getElementById("app-root");let html="";
@@ -1304,19 +1408,36 @@ createReservationTransaction = async function(room,detail,guestInfo){
   const reservationRef=db.collection("reservations").doc();
   const roomRef=db.collection("rooms").doc(String(room.id));
   await db.runTransaction(async tx=>{
+    const physicalSnap=await tx.get(db.collection("rooms").where("roomTypeId","==",room.id));
+    const requestedStart=new Date(`${detail.checkin}T00:00:00`).getTime(), requestedEnd=new Date(`${detail.checkout}T00:00:00`).getTime();
+    const availablePhysical=physicalSnap.docs.filter(doc => {
+      const roomData=doc.data();
+      if ((roomData.status || "Available") !== "Available") return false;
+      return !(roomData.bookings || []).some(booking => {
+        const start=new Date(`${booking.checkin}T00:00:00`).getTime(), end=new Date(`${booking.checkout}T00:00:00`).getTime();
+        return requestedStart < end && requestedEnd > start;
+      });
+    });
     const snapshot=await tx.get(roomRef);
     const data=snapshot.exists?snapshot.data():{};
-    const count=Number(data.availabilityCount??room.availability??0);
+    const count=physicalSnap.size ? availablePhysical.length : Number(data.availabilityCount??room.availability??0);
     if(count<=0) throw new Error("This room is no longer available.");
-    tx.set(roomRef,{availabilityCount:count-1,status:count===1?"Occupied":"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+    const assignedRoom=availablePhysical[0];
+    if(physicalSnap.size && !assignedRoom) throw new Error("No physical room is available for these dates.");
+    tx.set(roomRef,{availabilityCount:Math.max(0,count-1),status:count===1?"Occupied":"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
+    if(assignedRoom){
+      const assignedData=assignedRoom.data();
+      tx.update(assignedRoom.ref,{status:"Occupied",bookings:[...(assignedData.bookings||[]),{reservationId:reservationRef.id,checkin:detail.checkin,checkout:detail.checkout}],updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+    }
     tx.set(reservationRef,{
       reference,reservationId:reservationRef.id,roomId:room.id,roomName:room.name,roomType:room.type,
-      roomImage:room.img,destination:room.destination,location:room.location,
+      roomImage:room.img,destination:room.destination,location:room.location,roomTypeId:room.id,roomTypeName:room.name,
+      assignedRoomId:assignedRoom ? assignedRoom.id : null,assignedRoomNumber:assignedRoom ? assignedRoom.data().roomNumber : null,
       guestUid:currentUser().uid,userId:currentUser().uid,guestName:guestInfo.name,leadGuest:guestInfo.name,
       guestEmail:guestInfo.email,contactNumber:guestInfo.contactNumber,checkin:detail.checkin,checkIn:detail.checkin,
       checkout:detail.checkout,checkOut:detail.checkout,checkinTime:detail.checkinTime||"15:00",
       nights,guests:detail.guests,extras,roomPrice:room.price,extrasPrice,subtotal,taxes,totalPrice:total,total,
-      status:"confirmed",createdAtMs:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp(),
+      status:"pending",createdAtMs:Date.now(),createdAt:firebase.firestore.FieldValue.serverTimestamp(),
       updatedAt:firebase.firestore.FieldValue.serverTimestamp(),loyaltyPointsAwarded:false
     });
   });
@@ -1362,7 +1483,7 @@ renderReservationsView = function(){
   const reservationCard = r => {
     const room = reservationRoom(r);
     const status = normalizedStatus(r.status);
-    const locked = ["cancelled","completed"].includes(status) || String(r.checkout || r.checkOut || "") < today;
+    const locked = ["cancelled","rejected","completed"].includes(status) || String(r.checkout || r.checkOut || "") < today;
     return `<div class="rounded-xl p-3 flex gap-3" style="background:#171612;border:1px solid rgba(200,146,42,.15)">
       <img src="${img(r.roomImage || (room && room.img) || "1566073771259-6a8506099945",240,160)}" alt="${esc(r.roomName || "StayLink room")}" class="w-28 h-20 object-cover rounded-lg">
       <div class="flex-1 min-w-0"><div class="flex justify-between gap-2"><p class="font-display text-lg text-cream truncate">${esc(r.roomName || "StayLink room")}</p><span class="text-xs uppercase ${status==="cancelled"?"text-red-400":"text-gold"}">${status}</span></div>
@@ -1402,10 +1523,9 @@ renderReservationsView = function(){
 confirmCancellation = enhancedConfirmCancellation;
 
 /* ============================= STAFF DASHBOARD ============================= */
-const adminStatusLabels = { pending:"Pending", confirmed:"Confirmed", "checked-in":"Checked-In", "checked-out":"Checked-Out", cancelled:"Cancelled", completed:"Checked-Out" };
-const adminStatusColors = { pending:"#E8B84B", confirmed:"#34C759", "checked-in":"#5AC8FA", "checked-out":"#9B9488", cancelled:"#FF6961", completed:"#9B9488" };
+const adminStatusLabels = { pending:"Pending", confirmed:"Confirmed", rejected:"Rejected", "checked-in":"Checked-In", "checked-out":"Checked-Out", cancelled:"Cancelled", completed:"Checked-Out" };
+const adminStatusColors = { pending:"#E8B84B", confirmed:"#34C759", rejected:"#FF6961", "checked-in":"#5AC8FA", "checked-out":"#9B9488", cancelled:"#FF6961", completed:"#9B9488" };
 const adminSearch = { reservations:"", guests:"" };
-const adminRoomOverrides = {};
 
 function adminDate(value){ return formatDate(value); }
 function adminRoom(room){
@@ -1414,35 +1534,43 @@ function adminRoom(room){
 }
 function adminReservationStatus(r){ return normalizedStatus(r.status); }
 function adminReservationCanCheckIn(r){
-  return !["cancelled","checked-in","checked-out","completed"].includes(adminReservationStatus(r));
+  return ["confirmed"].includes(adminReservationStatus(r));
 }
 function adminReservationCanCheckOut(r){
   return ["checked-in"].includes(adminReservationStatus(r));
 }
 function adminReservationCanCancel(r){
-  return !["cancelled","checked-out","completed"].includes(adminReservationStatus(r));
+  return !["cancelled","rejected","checked-out","completed"].includes(adminReservationStatus(r));
 }
+function adminReservationCanDecide(r){ return adminReservationStatus(r) === "pending"; }
 async function adminUpdateReservation(id, status){
   if (!isAdmin()) throw new Error("Staff access required.");
   const item = allReservations.find(r => r.id === id);
   if (!item) throw new Error("Reservation not found.");
+  if (status === "rejected" && !adminReservationCanDecide(item)) throw new Error("This reservation has already been decided.");
   if (status === "cancelled" && !adminReservationCanCancel(item)) throw new Error("This reservation cannot be cancelled.");
   await db.collection("reservations").doc(id).update({
     status,
     updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
     ...(status === "checked-in" ? { checkedInAt: firebase.firestore.FieldValue.serverTimestamp() } : {}),
     ...(status === "checked-out" ? { checkedOutAt: firebase.firestore.FieldValue.serverTimestamp() } : {}),
+    ...(status === "rejected" ? { cancellationReason:"Rejected by hotel staff", rejectedAt:firebase.firestore.FieldValue.serverTimestamp() } : {}),
     ...(status === "cancelled" ? { cancellationReason:"Cancelled by hotel staff", cancelledAt:firebase.firestore.FieldValue.serverTimestamp() } : {})
   });
-  if (status === "cancelled") {
+  if (status === "rejected" || status === "cancelled") {
     const room = reservationRoom(item);
     if (room) await db.collection("rooms").doc(String(room.id)).set({
       availabilityCount: firebase.firestore.FieldValue.increment(1),
       status:"Available",
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     }, { merge:true });
+    await releasePhysicalBooking(item);
   }
-  toast(status === "cancelled" ? "Booking cancelled and room released." : `Booking marked ${adminStatusLabels[status] || status}.`);
+  if (status === "checked-out") {
+    await releasePhysicalBooking(item);
+    await syncRoomTypeSummary(item.roomTypeId || item.roomId);
+  }
+  toast(status === "rejected" ? "Reservation rejected and room released." : status === "cancelled" ? "Booking cancelled and room released." : `Booking marked ${adminStatusLabels[status] || status}.`);
 }
 async function adminChangeReservation(id, status){
   try { await adminUpdateReservation(id, status); }
@@ -1458,9 +1586,30 @@ async function adminSaveRoom(roomId, field, value){
     toast(field === "price" ? "Room rate updated." : `Room ${value ? "listed" : "hidden"}.`);
   } catch (e) { toast(e.message || "Unable to update room settings."); }
 }
+const adminSearchDraft = { reservations:"", guests:"" };
 function setAdminSearch(section, value){ adminSearch[section] = value; render(); }
+function setAdminSearchDraft(section, value){ adminSearchDraft[section] = value; }
+function applyAdminSearch(section){ adminSearch[section] = adminSearchDraft[section] || ""; render(); }
+function setAdminRoomType(value){ state.admin.roomTypeId = String(value); render(); }
+async function releasePhysicalBooking(item){
+  if (!item.assignedRoomId) return;
+  const ref = db.collection("rooms").doc(item.assignedRoomId);
+  await db.runTransaction(async tx => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return;
+    const data = snap.data() || {};
+    tx.update(ref, {
+      status: "Available",
+      bookings: (data.bookings || []).filter(booking => booking.reservationId !== item.id),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+  });
+  if (item.roomTypeId != null) await syncRoomTypeSummary(item.roomTypeId);
+}
 function openAdminReservation(id){ state.admin.detailId = id; render(); }
 function closeAdminReservation(){ state.admin.detailId = null; render(); }
+function openAdminGuest(id){ state.admin.guestId = id; render(); }
+function closeAdminGuest(){ state.admin.guestId = null; render(); }
 function renderAdminReservationModal(item){
   if (!item) return "";
   const extras = item.extras || {};
@@ -1470,21 +1619,38 @@ function renderAdminReservationModal(item){
       <div class="grid grid-cols-2 gap-3 mt-6 text-sm"><div><p class="text-dim text-xs">Email</p><p class="text-cream mt-1">${esc(item.guestEmail || "Not specified")}</p></div><div><p class="text-dim text-xs">Guests</p><p class="text-cream mt-1">${item.guests || 1}</p></div><div><p class="text-dim text-xs">Room</p><p class="text-cream mt-1">${esc(item.roomName || "Room")}</p></div><div><p class="text-dim text-xs">Total</p><p class="text-gold mt-1">${money(item.total || item.totalPrice)}</p></div><div><p class="text-dim text-xs">Dates</p><p class="text-cream mt-1">${adminDate(item.checkin || item.checkIn)} – ${adminDate(item.checkout || item.checkOut)}</p></div><div><p class="text-dim text-xs">Status</p><p class="mt-1" style="color:${adminStatusColors[adminReservationStatus(item)] || "#EDE8DC"}">${adminStatusLabels[adminReservationStatus(item)] || adminReservationStatus(item)}</p></div></div>
       <div class="mt-5"><p class="text-dim text-xs">Special requests</p><p class="text-cream text-sm mt-1">${esc(item.specialRequests || item.notes || "None")}</p></div>
       <p class="text-dim text-xs mt-5">Extras: <span class="text-cream">${extras.breakfast ? "Daily Breakfast" : ""}${extras.breakfast && extras.spa ? " · " : ""}${extras.spa ? "Wellness Spa Access" : (!extras.breakfast ? "None" : "")}</span></p>
-      <div class="flex flex-wrap gap-2 mt-6">${adminReservationCanCheckIn(item) ? `<button onclick="adminChangeReservation('${item.id}','checked-in');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Check In</button>` : ""}${adminReservationCanCheckOut(item) ? `<button onclick="adminChangeReservation('${item.id}','checked-out');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Check Out</button>` : ""}${adminReservationCanCancel(item) ? `<button onclick="adminChangeReservation('${item.id}','cancelled');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg text-red-300" style="border:1px solid rgba(255,69,58,.35)">Cancel Booking</button>` : ""}</div>
+      <div class="flex flex-wrap gap-2 mt-6">${adminReservationCanDecide(item) ? `<button onclick="adminChangeReservation('${item.id}','confirmed');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Accept Reservation</button><button onclick="adminChangeReservation('${item.id}','rejected');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg text-red-300" style="border:1px solid rgba(255,69,58,.35)">Reject Reservation</button>` : ""}${adminReservationCanCheckIn(item) ? `<button onclick="adminChangeReservation('${item.id}','checked-in');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Check In</button>` : ""}${adminReservationCanCheckOut(item) ? `<button onclick="adminChangeReservation('${item.id}','checked-out');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg bg-gold text-surface">Check Out</button>` : ""}${adminReservationCanCancel(item) ? `<button onclick="adminChangeReservation('${item.id}','cancelled');closeAdminReservation()" class="text-xs px-3 py-2 rounded-lg text-red-300" style="border:1px solid rgba(255,69,58,.35)">Cancel Booking</button>` : ""}</div>
     </div></div>`;
 }
 function adminReservationsTable(list){
   if (!list.length) return `<div class="text-center py-16 rounded-xl" style="border:1px dashed rgba(200,146,42,.2);"><p class="text-dim">No bookings match this view.</p></div>`;
-  return `<div class="rounded-xl overflow-x-auto" style="border:1px solid rgba(200,146,42,.15);"><table class="w-full text-sm min-w-[850px]"><thead><tr style="background:#171612;border-bottom:1px solid rgba(200,146,42,.15);">${["Guest / Email","Room","Dates","Total","Status","Actions"].map(h=>`<th class="text-left px-4 py-3 text-dim text-[11px] uppercase tracking-wider font-medium">${h}</th>`).join("")}</tr></thead><tbody>${list.map(r=>{const s=adminReservationStatus(r), color=adminStatusColors[s]||"#EDE8DC";return `<tr style="border-bottom:1px solid rgba(200,146,42,.08);"><td class="px-4 py-3 text-cream">${esc(r.guestName||r.leadGuest||"Guest")}<div class="text-dim text-[11px]">${esc(r.guestEmail||"")}</div></td><td class="px-4 py-3 text-dim">${esc(r.roomName||"Room")}</td><td class="px-4 py-3 text-dim">${adminDate(r.checkin||r.checkIn)}<br>– ${adminDate(r.checkout||r.checkOut)}</td><td class="px-4 py-3 text-cream">${money(r.total||r.totalPrice)}</td><td class="px-4 py-3"><span class="text-[11px]" style="color:${color}">${adminStatusLabels[s]||s}</span></td><td class="px-4 py-3"><div class="flex flex-wrap gap-2"><button onclick="openAdminReservation('${r.id}')" class="text-[11px] text-gold">View Details</button>${adminReservationCanCheckIn(r)?`<button onclick="adminChangeReservation('${r.id}','checked-in')" class="text-[11px] text-dim">Check-In</button>`:""}${adminReservationCanCheckOut(r)?`<button onclick="adminChangeReservation('${r.id}','checked-out')" class="text-[11px] text-dim">Check-Out</button>`:""}${adminReservationCanCancel(r)?`<button onclick="adminChangeReservation('${r.id}','cancelled')" class="text-[11px] text-red-300">Cancel</button>`:""}</div></td></tr>`;}).join("")}</tbody></table></div>`;
+  return `<div class="rounded-xl overflow-x-auto" style="border:1px solid rgba(200,146,42,.15);"><table class="w-full text-sm min-w-[850px]"><thead><tr style="background:#171612;border-bottom:1px solid rgba(200,146,42,.15);">${["Guest / Email","Room","Dates","Total","Status","Actions"].map(h=>`<th class="text-left px-4 py-3 text-dim text-[11px] uppercase tracking-wider font-medium">${h}</th>`).join("")}</tr></thead><tbody>${list.map(r=>{const s=adminReservationStatus(r), color=adminStatusColors[s]||"#EDE8DC";return `<tr style="border-bottom:1px solid rgba(200,146,42,.08);"><td class="px-4 py-3 text-cream">${esc(r.guestName||r.leadGuest||"Guest")}<div class="text-dim text-[11px]">${esc(r.guestEmail||"")}</div></td><td class="px-4 py-3 text-dim">${esc(r.roomName||"Room")}<div class="text-gold text-[11px]">${esc(r.assignedRoomNumber||"Room not assigned")}</div></td><td class="px-4 py-3 text-dim">${adminDate(r.checkin||r.checkIn)}<br>– ${adminDate(r.checkout||r.checkOut)}</td><td class="px-4 py-3 text-cream">${money(r.total||r.totalPrice)}</td><td class="px-4 py-3"><span class="text-[11px]" style="color:${color}">${adminStatusLabels[s]||s}</span></td><td class="px-4 py-3"><div class="flex flex-wrap gap-2"><button onclick="openAdminReservation('${r.id}')" class="text-[11px] text-gold">View Details</button>${adminReservationCanDecide(r)?`<button onclick="adminChangeReservation('${r.id}','confirmed')" class="text-[11px] text-green-300">Accept</button><button onclick="adminChangeReservation('${r.id}','rejected')" class="text-[11px] text-red-300">Reject</button>`:""}${adminReservationCanCheckIn(r)?`<button onclick="adminChangeReservation('${r.id}','checked-in')" class="text-[11px] text-dim">Check-In</button>`:""}${adminReservationCanCheckOut(r)?`<button onclick="adminChangeReservation('${r.id}','checked-out')" class="text-[11px] text-dim">Check-Out</button>`:""}${adminReservationCanCancel(r)?`<button onclick="adminChangeReservation('${r.id}','cancelled')" class="text-[11px] text-red-300">Cancel</button>`:""}</div></td></tr>`;}).join("")}</tbody></table></div>`;
 }
 function adminRoomsPanel(){
-  const cycle = { Available:"Occupied", Occupied:"Cleaning", Cleaning:"Available" };
-  return `<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">${ROOMS.map(base=>{const r=adminRoom(base), status=roomStatus[r.id]||"Available", color=status==="Available"?"#34C759":status==="Occupied"?"#FF453A":"#E8B84B";return `<div class="rounded-xl p-5" style="background:#171612;border:1px solid rgba(200,146,42,.15)"><div class="flex justify-between gap-3"><div><p class="text-cream font-medium">${esc(r.name)}</p><p class="text-dim text-xs">${esc(r.type)} · ${esc(r.destination)}</p></div><span class="text-xs" style="color:${color}">● ${status}</span></div><div class="flex gap-2 mt-4"><button onclick="adminCycleRoomStatus(${r.id})" class="flex-1 text-[11px] text-gold py-2 rounded-lg" style="border:1px solid rgba(200,146,42,.25)">Mark ${cycle[status]||"Available"}</button><button onclick="adminSaveRoom(${r.id},'visible',${r.visible === false ? "true" : "false"})" class="text-[11px] text-dim px-3 py-2 rounded-lg" style="border:1px solid rgba(200,146,42,.15)">${r.visible === false ? "Show" : "Hide"}</button></div><label class="block text-dim text-xs mt-4">Price per night<input type="number" min="0" value="${Number(r.price||0)}" onchange="adminSaveRoom(${r.id},'price',this.value)" class="w-full mt-1 bg-[#0B0B09] text-cream rounded-lg p-2 outline-none"></label></div>`;}).join("")}</div>`;
+  const selectedType = ROOMS.find(room => String(room.id) === String(state.admin.roomTypeId)) || ROOMS[0];
+  const rooms = roomTypePhysicalRooms(selectedType.id);
+  const color = status => status==="Available" ? "#34C759" : status==="Occupied" ? "#FF453A" : "#E8B84B";
+  return `<div class="rounded-xl p-5 mb-6" style="background:#171612;border:1px solid rgba(200,146,42,.15)"><label class="text-dim text-xs uppercase tracking-wider">Room type<select onchange="setAdminRoomType(this.value)" class="block w-full md:w-96 mt-2 bg-[#0B0B09] text-cream rounded-lg p-3 outline-none">${ROOMS.map(room=>`<option value="${room.id}" ${String(room.id)===String(selectedType.id)?"selected":""}>${esc(room.name)}</option>`).join("")}</select></label><p class="text-dim text-sm mt-4">Physical rooms for ${esc(selectedType.name)}. Change each room's operational status using its dropdown.</p></div><div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-8">${rooms.map(item=>{const status=item.status||"Available";return `<div class="rounded-xl p-5" style="background:#171612;border:1px solid ${color(status)}55"><div class="flex justify-between items-center"><span class="font-display text-xl text-cream">${esc(item.roomNumber)}</span><span class="text-xs" style="color:${color(status)}">● ${status}</span></div><label class="block text-dim text-xs mt-4">Room status<select onchange="adminSetPhysicalRoomStatus('${item.id}',this.value)" class="w-full mt-2 bg-[#0B0B09] text-cream text-sm rounded-lg p-2.5 outline-none">${["Available","Occupied","Cleaning"].map(option=>`<option ${status===option?"selected":""}>${option}</option>`).join("")}</select></label><p class="text-dim text-xs mt-3">${status==="Available"?"Ready to assign":"Operational status"}</p></div>`;}).join("")}</div>`;
+}
+async function adminSetPhysicalRoomStatus(roomId, next){
+  const item=physicalRooms.find(room=>room.id===roomId);
+  if(!item)return;
+  if(!next)return;
+  const status=String(next);
+  if(!["Available","Occupied","Cleaning"].includes(status)){toast("Choose Available, Occupied, or Cleaning.");return;}
+  try{await db.collection("rooms").doc(roomId).set({status,updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});toast(`${item.roomNumber} marked ${status}.`);}catch(e){toast(e.message||"Unable to update room status.");}
+}
+function adminGuestProfileModal(user){
+  if (!user) return "";
+  const bookings = allReservations.filter(r => r.guestUid === user.id || r.userId === user.id);
+  return `<div class="fixed inset-0 z-[90] flex items-center justify-center p-4" style="background:rgba(11,11,9,.84)" onclick="if(event.target===this)closeAdminGuest()"><div class="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-2xl p-6" style="background:#171612;border:1px solid rgba(200,146,42,.25)"><div class="flex justify-between items-start"><div><p class="text-gold text-xs uppercase tracking-wider">Guest profile</p><h3 class="font-display text-2xl text-cream mt-2">${esc(user.displayName||"Guest")}</h3><p class="text-dim text-sm mt-1">${esc(user.email||"Not specified")}</p></div><button onclick="closeAdminGuest()" class="text-dim">✕</button></div><div class="grid grid-cols-2 gap-3 mt-6 text-sm"><div><p class="text-dim text-xs">Date joined</p><p class="text-cream mt-1">${user.createdAt ? adminDate(user.createdAt.toDate ? user.createdAt.toDate().toISOString().slice(0,10) : user.createdAt) : "Not specified"}</p></div><div><p class="text-dim text-xs">Total bookings</p><p class="text-cream mt-1">${bookings.length}</p></div><div><p class="text-dim text-xs">Loyalty</p><p class="text-gold mt-1">${esc(user.membership||"Bronze")}</p></div><div><p class="text-dim text-xs">Points</p><p class="text-cream mt-1">${Number(user.loyaltyPoints||0).toLocaleString()}</p></div></div><h4 class="font-display text-xl text-cream mt-7 mb-3">Booking history</h4>${bookings.length ? `<div class="space-y-2">${bookings.map(r=>`<div class="rounded-lg p-3" style="background:#0B0B09"><div class="flex justify-between gap-3"><span class="text-cream text-sm">${esc(r.roomName||"Room")}</span><span class="text-gold text-xs">${adminStatusLabels[adminReservationStatus(r)]||adminReservationStatus(r)}</span></div><p class="text-dim text-xs mt-1">${adminDate(r.checkin||r.checkIn)} – ${adminDate(r.checkout||r.checkOut)}</p></div>`).join("")}</div>` : `<p class="text-dim text-sm">No bookings yet.</p>`}</div></div>`;
 }
 function adminGuestDirectory(){
   const query = adminSearch.guests.toLowerCase();
-  const guests = allUsers.filter(u => `${u.email||""} ${u.displayName||""}`.toLowerCase().includes(query));
-  return `<div class="rounded-xl overflow-x-auto" style="border:1px solid rgba(200,146,42,.15);"><table class="w-full min-w-[650px] text-sm"><thead><tr style="background:#171612;border-bottom:1px solid rgba(200,146,42,.15);">${["Guest","Email","Date Joined","Total Bookings","Loyalty"].map(h=>`<th class="text-left px-4 py-3 text-dim text-[11px] uppercase tracking-wider">${h}</th>`).join("")}</tr></thead><tbody>${guests.map(u=>{const bookings=allReservations.filter(r=>r.guestUid===u.id||r.userId===u.id).length;return `<tr style="border-bottom:1px solid rgba(200,146,42,.08)"><td class="px-4 py-3 text-cream">${esc(u.displayName||"Guest")}</td><td class="px-4 py-3 text-dim">${esc(u.email||"Not specified")}</td><td class="px-4 py-3 text-dim">${u.createdAt ? adminDate(u.createdAt.toDate ? u.createdAt.toDate().toISOString().slice(0,10) : u.createdAt) : "Not specified"}</td><td class="px-4 py-3 text-cream">${bookings}</td><td class="px-4 py-3 text-gold">${esc(u.membership||"Bronze")} · ${Number(u.loyaltyPoints||0).toLocaleString()} pts</td></tr>`;}).join("")}</tbody></table></div>`;
+  const guests = allUsers
+    .filter(user => !ADMIN_EMAILS.some(email => String(user.email || "").toLowerCase() === email.toLowerCase()))
+    .filter(u => `${u.email||""} ${u.displayName||""}`.toLowerCase().includes(query));
+  return `<div class="rounded-xl overflow-x-auto" style="border:1px solid rgba(200,146,42,.15);"><table class="w-full min-w-[760px] text-sm"><thead><tr style="background:#171612;border-bottom:1px solid rgba(200,146,42,.15);">${["Email","Date Joined","Total Bookings","Action"].map(h=>`<th class="text-left px-4 py-3 text-dim text-[11px] uppercase tracking-wider">${h}</th>`).join("")}</tr></thead><tbody>${guests.map(u=>{const bookings=allReservations.filter(r=>r.guestUid===u.id||r.userId===u.id).length;return `<tr style="border-bottom:1px solid rgba(200,146,42,.08)"><td class="px-4 py-3 text-cream">${esc(u.email||"Not specified")}</td><td class="px-4 py-3 text-dim">${u.createdAt ? adminDate(u.createdAt.toDate ? u.createdAt.toDate().toISOString().slice(0,10) : u.createdAt) : "Not specified"}</td><td class="px-4 py-3 text-cream">${bookings}</td><td class="px-4 py-3"><button onclick="openAdminGuest('${esc(u.id)}')" class="text-[11px] text-gold px-3 py-1.5 rounded-lg" style="border:1px solid rgba(200,146,42,.3)">View Profile</button></td></tr>`;}).join("")}</tbody></table></div>`;
 }
 function adminStats(){
   const today = new Date(); today.setHours(0,0,0,0);
@@ -1494,12 +1660,12 @@ function adminStats(){
 }
 function renderAdminView(){
   if (!isAdmin()) return renderAdminDeniedView();
-  const sec=state.admin.section||"overview", stats=adminStats(), selected=state.admin.detailId ? allReservations.find(r=>r.id===state.admin.detailId) : null;
+  const sec=state.admin.section||"overview", stats=adminStats(), selected=state.admin.detailId ? allReservations.find(r=>r.id===state.admin.detailId) : null, selectedGuest=state.admin.guestId ? allUsers.find(user=>user.id===state.admin.guestId) : null;
   const nav = [["overview","Overview"],["reservations","Reservations"],["rooms","Rooms & Inventory"],["guests","Guest Directory"]];
   const heading={overview:"Dashboard overview",reservations:"Reservations management",rooms:"Room & inventory management",guests:"Guest directory"}[sec];
   const query=adminSearch.reservations.toLowerCase();
   const bookings=allReservations.filter(r=>`${r.guestName||r.leadGuest||""} ${r.guestEmail||""} ${r.roomName||""} ${r.status||""}`.toLowerCase().includes(query));
-  return `<div class="pt-16 min-h-screen fade-in flex flex-col md:flex-row"><aside class="md:w-60 flex-shrink-0 p-4 md:p-6 md:min-h-[calc(100vh-4rem)]" style="border-right:1px solid rgba(200,146,42,.12);background:#0B0B09"><p class="text-gold text-[10px] uppercase tracking-[.2em] px-3">Staff console</p><p class="text-dim text-xs px-3 mt-1 mb-5">${esc(currentUser().email)}</p><div class="flex md:flex-col gap-1.5 overflow-x-auto">${nav.map(([id,label])=>`<button onclick="setAdminSection('${id}')" class="text-left whitespace-nowrap px-3 py-2.5 rounded-lg text-sm ${sec===id?"bg-gold text-surface font-semibold":"text-dim hover:text-cream"}">${label}</button>`).join("")}</div><button onclick="signOut()" class="text-red-300 text-xs px-3 py-2 mt-6">Sign out</button></aside><section class="flex-1 px-5 py-8 md:px-8 max-w-7xl"><p class="text-gold text-[10px] tracking-[.3em] uppercase mb-2">StayLink administration</p><h1 class="font-display text-4xl text-cream mb-7">${heading}</h1>${sec==="overview"?`<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">${[["Upcoming bookings",stats.upcoming,"This week"],["Occupied rooms",stats.occupied,"Today"],["Rooms needing cleaning",stats.cleaning,"Current status"],["Registered guests",stats.guests,"All accounts"]].map(([label,value,note])=>`<div class="rounded-xl p-5" style="background:#171612;border:1px solid rgba(200,146,42,.15)"><p class="text-dim text-[11px] uppercase tracking-wider">${label}</p><p class="font-display text-3xl text-gold mt-2">${value}</p><p class="text-dim text-xs mt-1">${note}</p></div>`).join("")}</div><div class="flex flex-wrap gap-3 mb-8"><button onclick="setAdminSection('rooms')" class="px-4 py-3 rounded-lg bg-gold text-surface text-sm">Add New Room</button><button onclick="setAdminSection('reservations')" class="px-4 py-3 rounded-lg text-gold text-sm" style="border:1px solid rgba(200,146,42,.3)">View All Bookings</button></div><h2 class="font-display text-2xl text-cream mb-4">Latest bookings</h2>${adminReservationsTable(allReservations.slice(0,6))}`:sec==="reservations"?`<div class="flex flex-wrap gap-3 mb-5"><input value="${esc(adminSearch.reservations)}" oninput="setAdminSearch('reservations',this.value)" placeholder="Search guest, email, room, status" class="flex-1 min-w-[240px] bg-[#171612] text-cream text-sm rounded-lg p-3 outline-none" style="border:1px solid rgba(200,146,42,.2)"><select onchange="setAdminSearch('reservations',this.value)" class="bg-[#171612] text-cream text-sm rounded-lg p-3"><option value="">All statuses</option>${Object.entries(adminStatusLabels).map(([v,l])=>`<option value="${v}" ${adminSearch.reservations===v?"selected":""}>${l}</option>`).join("")}</select></div>${adminReservationsTable(bookings)}`:sec==="rooms"?`<div class="flex items-center justify-between mb-4"><p class="text-dim text-sm">Live floor status and room settings</p><button onclick="toast('Use the room cards below to manage inventory.')" class="text-xs text-gold">Room settings help</button></div>${adminRoomsPanel()}`:`<div class="flex gap-3 mb-5"><input value="${esc(adminSearch.guests)}" oninput="setAdminSearch('guests',this.value)" placeholder="Search guests by name or email" class="w-full bg-[#171612] text-cream text-sm rounded-lg p-3 outline-none" style="border:1px solid rgba(200,146,42,.2)"></div>${adminGuestDirectory()}`}</section></div>${renderAdminReservationModal(selected)}`;
+  return `<div class="pt-16 min-h-screen fade-in flex flex-col md:flex-row"><aside class="md:w-60 flex-shrink-0 p-4 md:p-6 md:min-h-[calc(100vh-4rem)]" style="border-right:1px solid rgba(200,146,42,.12);background:#0B0B09"><p class="text-gold text-[10px] uppercase tracking-[.2em] px-3">Staff console</p><p class="text-dim text-xs px-3 mt-1 mb-5">${esc(currentUser().email)}</p><div class="flex md:flex-col gap-1.5 overflow-x-auto">${nav.map(([id,label])=>`<button onclick="setAdminSection('${id}')" class="text-left whitespace-nowrap px-3 py-2.5 rounded-lg text-sm ${sec===id?"bg-gold text-surface font-semibold":"text-dim hover:text-cream"}">${label}</button>`).join("")}</div><button onclick="signOut()" class="text-red-300 text-xs px-3 py-2 mt-6">Sign out</button></aside><section class="flex-1 px-5 py-8 md:px-8 max-w-7xl"><p class="text-gold text-[10px] tracking-[.3em] uppercase mb-2">StayLink administration</p><h1 class="font-display text-4xl text-cream mb-7">${heading}</h1>${sec==="overview"?`<div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-10">${[["Upcoming bookings",stats.upcoming,"This week"],["Occupied rooms",stats.occupied,"Today"],["Rooms needing cleaning",stats.cleaning,"Current status"],["Registered guests",stats.guests,"All accounts"]].map(([label,value,note])=>`<div class="rounded-xl p-5" style="background:#171612;border:1px solid rgba(200,146,42,.15)"><p class="text-dim text-[11px] uppercase tracking-wider">${label}</p><p class="font-display text-3xl text-gold mt-2">${value}</p><p class="text-dim text-xs mt-1">${note}</p></div>`).join("")}</div><div class="flex flex-wrap gap-3 mb-8"><button onclick="setAdminSection('rooms')" class="px-4 py-3 rounded-lg bg-gold text-surface text-sm">Add New Room</button><button onclick="setAdminSection('reservations')" class="px-4 py-3 rounded-lg text-gold text-sm" style="border:1px solid rgba(200,146,42,.3)">View All Bookings</button></div><h2 class="font-display text-2xl text-cream mb-4">Latest bookings</h2>${adminReservationsTable(allReservations.slice(0,6))}`:sec==="reservations"?`<div class="flex flex-wrap gap-3 mb-5"><input value="${esc(adminSearch.reservations)}" oninput="setAdminSearch('reservations',this.value)" placeholder="Search guest, email, room, status" class="flex-1 min-w-[240px] bg-[#171612] text-cream text-sm rounded-lg p-3 outline-none" style="border:1px solid rgba(200,146,42,.2)"><select onchange="setAdminSearch('reservations',this.value)" class="bg-[#171612] text-cream text-sm rounded-lg p-3"><option value="">All statuses</option>${Object.entries(adminStatusLabels).map(([v,l])=>`<option value="${v}" ${adminSearch.reservations===v?"selected":""}>${l}</option>`).join("")}</select></div>${adminReservationsTable(bookings)}  `:sec==="rooms"?`<div class="flex items-center justify-between mb-4"><p class="text-dim text-sm">Live floor status and room settings</p><button onclick="toast('Use the room cards below to manage inventory.')" class="text-xs text-gold">Room settings help</button></div>${adminRoomsPanel()}`:`<div class="flex gap-3 mb-5"><input value="${esc(adminSearchDraft.guests||adminSearch.guests)}" oninput="setAdminSearchDraft('guests',this.value)" onkeydown="if(event.key==='Enter')applyAdminSearch('guests')" placeholder="Search guests by name or email" class="flex-1 bg-[#171612] text-cream text-sm rounded-lg p-3 outline-none" style="border:1px solid rgba(200,146,42,.2)"><button onclick="applyAdminSearch('guests')" class="px-5 py-3 rounded-lg bg-gold text-surface text-sm">Search</button></div>${adminGuestDirectory()}`}</section></div>${renderAdminReservationModal(selected)}${adminGuestProfileModal(selectedGuest)}`;
 }
 function setAdminSection(section){ state.admin.section=section; state.admin.detailId=null; render(); }
 function renderTopNav(){
@@ -1543,6 +1709,7 @@ function initApp(){
         if (isAdmin()) {
           attachAllReservationsListener();
           attachAllUsersListener();
+          ensurePhysicalRooms().catch(error => console.warn("physical room setup error:", error));
           state.view = "admin";
         }
       } else {

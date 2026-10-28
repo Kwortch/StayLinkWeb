@@ -27,6 +27,9 @@ transactional data.
 - **My Stays** page showing only the signed-in guest's reservations.
 - **Reservation cancellation** that changes a reservation's status instead of
   deleting its record.
+- **Pending reservation approval**: new reservations are shown as `Pending`
+  until staff accepts or rejects them. Pending requests hold their assigned
+  physical room; rejected requests release the room back to inventory.
 - inventory-safe booking with Firestore transactions and availability restore
   on cancellation.
 
@@ -67,9 +70,18 @@ Dashboard**. The dashboard contains:
 - Per-booking **Check-In**, **Check-Out**, **Cancel Booking**, and **View
   Details** actions. Cancellation releases the room inventory.
 - A room and inventory grid with `Available`, `Occupied`, and `Cleaning`
-  status controls, editable nightly rates, and room visibility toggles.
+  status controls for individual physical rooms, editable nightly rates, and
+  room visibility toggles. Each room type is provisioned with five
+  human-readable room numbers, such as `DK-1` through `DK-5` for Deluxe King
+  Room and `POS-1` through `POS-5` for Premier Ocean Suite.
 - A guest directory showing account email, join date, booking count, loyalty
   tier, and points.
+
+New reservations check the physical rooms for the selected room type and date
+range, assign the first available room, and store the assigned room number on
+the reservation. The room-type availability count is retained for compatibility
+with the guest-facing catalog, while each physical room also stores its
+date-bound booking blocks.
 
 Admins do not see guest booking navigation or client pages; signing in with an
 allow-listed staff account opens the staff dashboard directly. The dashboard
@@ -116,11 +128,16 @@ StayLink/
 3. Selecting **Reserve** requires authentication. A visitor can sign in or
    create an account and then return to the selected room.
 4. The app calculates the subtotal from the nightly rate and number of nights,
-   adds 12% tax, and writes the reservation to Firestore.
-5. The room is marked `Occupied`, and the reservation appears in **My Stays**.
-6. A guest can cancel their own reservation. Cancellation is stored as a
+   adds 12% tax, and    writes the reservation to Firestore with `status: "pending"`.
+5. The first available physical room is assigned and held while the
+   reservation awaits staff approval. The reservation appears as `Pending` in
+   **My Stays**.
+6. Staff can accept the request (`confirmed`) or reject it (`rejected`).
+   Rejection removes the date-bound booking block and returns the physical room
+   to `Available`.
+7. A guest can cancel their own reservation. Cancellation is stored as a
    status update so the reservation history remains available.
-7. An allow-listed staff account can review all reservations and update room
+8. An allow-listed staff account can review all reservations and update room
    or reservation statuses from the dashboard.
 
 ## Firebase data model
@@ -155,8 +172,9 @@ guestUid, guestName, guestEmail
 leadGuest, contactNumber, checkin, checkout, checkinTime
 nights, guests, extras, roomPrice, extrasPrice
 subtotal, taxes, totalPrice, total
-status, createdAt, updatedAt, createdAtMs
-cancellationReason, cancelledAt
+status (`pending`, `confirmed`, `rejected`, `checked-in`, `checked-out`,
+`cancelled`), createdAt, updatedAt, createdAtMs
+cancellationReason, cancelledAt, rejectedAt
 loyaltyPointsAwarded, loyaltyPointsEarned, loyaltyLockedAt
 ```
 

@@ -38,7 +38,13 @@ service cloud.firestore {
          request.resource.data.diff(resource.data).affectedKeys()
            .hasOnly(['availabilityCount', 'status', 'updatedAt']) &&
          (request.resource.data.availabilityCount == resource.data.availabilityCount - 1 ||
-          request.resource.data.availabilityCount == resource.data.availabilityCount + 1));
+          request.resource.data.availabilityCount == resource.data.availabilityCount + 1)) ||
+        (request.auth != null &&
+         resource.data.roomTypeId != null &&
+         request.resource.data.diff(resource.data).affectedKeys()
+           .hasOnly(['bookings', 'status', 'updatedAt']) &&
+         request.resource.data.status in ['Available', 'Occupied'] &&
+         resource.data.status in ['Available', 'Occupied']);
     }
 
     // Reservations.
