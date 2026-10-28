@@ -166,6 +166,8 @@ let myReservations = [];   // reservations belonging to the signed-in guest
 let allReservations = [];  // every reservation (admin only)
 let allUsers = [];          // guest directory (admin only)
 let pendingBookingRoomId = null; // room the user was trying to book before we asked them to log in
+let bookingInProgress = false;
+let bookingAttemptId = null;
 
 function currentUser(){ return auth && auth.currentUser; }
 function isAdmin(){
@@ -1395,7 +1397,7 @@ renderDetailView = function(){
     </div>
   </div>`;
 };
-createReservationTransaction = async function(room,detail,guestInfo){
+createReservationTransaction = async function(room,detail,guestInfo,reservationId){
   if(!fbReady||!currentUser()) throw new Error("Please sign in before booking.");
   const nights=Math.max(1,Math.round((new Date(detail.checkout)-new Date(detail.checkin))/86400000));
   if(nights<1) throw new Error("Check-out must be after check-in.");
@@ -1405,12 +1407,17 @@ createReservationTransaction = async function(room,detail,guestInfo){
   const taxes=Math.round((subtotal+extrasPrice)*.12);
   const total=subtotal+extrasPrice+taxes;
   const reference=genReference();
-  const reservationRef=db.collection("reservations").doc();
+  const reservationRef=reservationId ? db.collection("reservations").doc(reservationId) : db.collection("reservations").doc();
   const roomRef=db.collection("rooms").doc(String(room.id));
   const physicalQuerySnap=await db.collection("rooms").where("roomTypeId","==",room.id).get();
   const physicalRefs=physicalQuerySnap.docs.map(doc=>doc.ref);
   await db.runTransaction(async tx=>{
     const physicalDocs=await Promise.all(physicalRefs.map(ref=>tx.get(ref)));
+    const existingReservation=await tx.get(reservationRef);
+    if (existingReservation.exists) {
+      if (existingReservation.data().guestUid !== currentUser().uid) throw new Error("Unable to reuse this reservation attempt.");
+      return;
+    }
     const requestedStart=new Date(`${detail.checkin}T00:00:00`).getTime(), requestedEnd=new Date(`${detail.checkout}T00:00:00`).getTime();
     const availablePhysical=physicalDocs.filter(doc => {
       const roomData=doc.data();
@@ -1460,14 +1467,23 @@ showReservationSaved = function(reference){
   }, 6000);
 };
 handleBook = async function(){
+  if (bookingInProgress) return;
   const room = ROOMS.find(r=>r.id===state.selectedRoomId);
   if (!room) return;
   if (!currentUser()){ pendingBookingRoomId=room.id; openAuth("login"); return; }
+  bookingInProgress = true;
+  bookingAttemptId = bookingAttemptId || db.collection("reservations").doc().id;
+  const button = document.getElementById("reserve-btn");
+  if (button) { button.disabled = true; button.textContent = "Saving reservation…"; button.setAttribute("aria-busy","true"); }
   try {
-    const ref = await createReservationTransaction(room,state.detail,{name:state.detail.leadGuest||currentUser().displayName||"StayLink Guest",email:currentUser().email,contactNumber:state.detail.contactNumber||userProfile.phone||""});
+    const ref = await createReservationTransaction(room,state.detail,{name:state.detail.leadGuest||currentUser().displayName||"StayLink Guest",email:currentUser().email,contactNumber:state.detail.contactNumber||userProfile.phone||""},bookingAttemptId);
     showReservationSaved(ref);
+    bookingInProgress = false;
+    bookingAttemptId = null;
     navigate("reservations");
   } catch (e) {
+    bookingInProgress = false;
+    bookingAttemptId = null;
     state.auth.error=e.message||"Unable to create reservation.";
     render();
   }
