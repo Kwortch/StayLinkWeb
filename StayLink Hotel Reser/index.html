@@ -1407,10 +1407,12 @@ createReservationTransaction = async function(room,detail,guestInfo){
   const reference=genReference();
   const reservationRef=db.collection("reservations").doc();
   const roomRef=db.collection("rooms").doc(String(room.id));
+  const physicalQuerySnap=await db.collection("rooms").where("roomTypeId","==",room.id).get();
+  const physicalRefs=physicalQuerySnap.docs.map(doc=>doc.ref);
   await db.runTransaction(async tx=>{
-    const physicalSnap=await tx.get(db.collection("rooms").where("roomTypeId","==",room.id));
+    const physicalDocs=await Promise.all(physicalRefs.map(ref=>tx.get(ref)));
     const requestedStart=new Date(`${detail.checkin}T00:00:00`).getTime(), requestedEnd=new Date(`${detail.checkout}T00:00:00`).getTime();
-    const availablePhysical=physicalSnap.docs.filter(doc => {
+    const availablePhysical=physicalDocs.filter(doc => {
       const roomData=doc.data();
       if ((roomData.status || "Available") !== "Available") return false;
       return !(roomData.bookings || []).some(booking => {
@@ -1420,10 +1422,10 @@ createReservationTransaction = async function(room,detail,guestInfo){
     });
     const snapshot=await tx.get(roomRef);
     const data=snapshot.exists?snapshot.data():{};
-    const count=physicalSnap.size ? availablePhysical.length : Number(data.availabilityCount??room.availability??0);
+    const count=physicalDocs.length ? availablePhysical.length : Number(data.availabilityCount??room.availability??0);
     if(count<=0) throw new Error("This room is no longer available.");
     const assignedRoom=availablePhysical[0];
-    if(physicalSnap.size && !assignedRoom) throw new Error("No physical room is available for these dates.");
+    if(physicalDocs.length && !assignedRoom) throw new Error("No physical room is available for these dates.");
     tx.set(roomRef,{availabilityCount:Math.max(0,count-1),status:count===1?"Occupied":"Available",updatedAt:firebase.firestore.FieldValue.serverTimestamp()},{merge:true});
     if(assignedRoom){
       const assignedData=assignedRoom.data();
