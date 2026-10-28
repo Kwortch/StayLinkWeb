@@ -14,18 +14,43 @@ transactional data.
 ### Guest experience
 
 - **Discover page** with a hotel introduction and booking search form.
-- **Room catalogue** with filtering by room type and sorting by rating, price,
-  or name.
+- **20-room Philippine catalogue** covering Manila, Cebu, Boracay, Palawan,
+  Davao, Baguio, Batangas, Tagaytay, Bohol, Siargao, and Iloilo.
+- **Room catalogue** with destination and room-type filtering, availability
+  counts, and sorting by rating or price.
 - **Room details** including photos, description, amenities, bed type, room
   size, view, guest capacity, rating, and reviews.
 - **Reservation flow** with check-in, check-out, guest count, guest details,
-  automatic night count, 12% tax calculation, and a generated reservation
-  reference.
+  exact check-in time, contact number, optional breakfast and wellness spa
+  extras, 12% tax calculation, and a generated Firebase reservation ID.
 - **Email/password authentication** with sign-in and account creation.
 - **My Stays** page showing only the signed-in guest's reservations.
 - **Reservation cancellation** that changes a reservation's status instead of
   deleting its record.
+- inventory-safe booking with Firestore transactions and availability restore
+  on cancellation.
+
+### Loyalty and voucher rules
+
+Points are awarded only after a confirmed stay's checkout date has passed.
+The reservation is then marked `completed` and locked from cancellation.
+Points are calculated once from the final total:
+
+```text
+floor((final total / 100) × current tier rate)
+```
+
+The `loyaltyPointsAwarded` flag and a Firestore transaction make completion
+idempotent across refreshes and live listeners. Voucher redemptions also use a
+transaction, verify the member tier and balance, deduct points atomically, and
+prevent the same voucher from being redeemed twice.
 - **Profile page** with the current account information and sign-out action.
+- **Profile preferences** for room type, bed, smoking, notifications,
+  language, and PHP currency.
+- **Rewards page** with Bronze, Silver, Gold, and Platinum/Diamond tiers,
+  progress tracking, points, and Firebase-backed voucher redemption.
+- **StayLink Promise** cards for Concierge, Fine Dining, Wellness Spa, and
+  Valet, with responsive detail modals.
 - **Responsive navigation** for desktop and mobile layouts.
 
 ### Staff experience
@@ -33,16 +58,23 @@ transactional data.
 Accounts whose email is on the admin allow-list can open the **Admin
 Dashboard**. The dashboard contains:
 
-- An overview of today's reservations, occupancy rate, revenue, and available
-  rooms.
-- A reservations table with guest, room, dates, status, and amount.
-- Reservation cancellation controls.
-- A room inventory table with nightly rate and live status.
-- Room status management cycling through `Available`, `Occupied`, and
-  `Cleaning`.
+- A staff-only overview with total upcoming bookings for the week, currently
+  occupied rooms, rooms needing cleaning, and registered guests.
+- Quick actions for opening all bookings and room inventory management.
+- A searchable and filterable reservations table with guest/email, room, dates,
+  total price, and `Pending`, `Confirmed`, `Checked-In`, `Checked-Out`, or
+  `Cancelled` status.
+- Per-booking **Check-In**, **Check-Out**, **Cancel Booking**, and **View
+  Details** actions. Cancellation releases the room inventory.
+- A room and inventory grid with `Available`, `Occupied`, and `Cleaning`
+  status controls, editable nightly rates, and room visibility toggles.
+- A guest directory showing account email, join date, booking count, loyalty
+  tier, and points.
 
-The dashboard and room availability update through Firestore snapshot
-listeners, so changes are reflected without manually refreshing the page.
+Admins do not see guest booking navigation or client pages; signing in with an
+allow-listed staff account opens the staff dashboard directly. The dashboard
+and room availability update through Firestore snapshot listeners, so changes
+are reflected without manually refreshing the page.
 
 ## Technology
 
@@ -57,6 +89,11 @@ listeners, so changes are reflected without manually refreshing the page.
 There is no build step or npm project. The deployable site is the
 [StayLink Hotel Reser](./StayLink%20Hotel%20Reser/) directory, whose
 `index.html` contains the application UI and logic.
+
+No environment variables are required by the current Firebase Hosting
+configuration. Firebase supplies the client configuration through
+`/__/firebase/init.js`; do not add API keys or service-account credentials to
+the repository.
 
 ## Project structure
 
@@ -88,6 +125,12 @@ StayLink/
 
 ## Firebase data model
 
+### `users/{userId}`
+
+Signed-in users can store their full name, email, address, phone, preferences,
+loyalty points, membership tier, and redeemed vouchers. Profile data is
+restricted to the owning Firebase Auth UID.
+
 ### `rooms/{roomId}`
 
 Room descriptions and content are defined in the `ROOMS` array in
@@ -95,6 +138,7 @@ Room descriptions and content are defined in the `ROOMS` array in
 
 ```text
 status: "Available" | "Occupied" | "Cleaning"
+availabilityCount: number
 ```
 
 Room documents are publicly readable so visitors can see live availability.
@@ -106,10 +150,14 @@ Reservation documents contain values including:
 
 ```text
 reference, roomId, roomName, roomType
+reservationId, destination, location, roomImage
 guestUid, guestName, guestEmail
-checkin, checkout, nights, guests
-subtotal, taxes, total
-status, createdAt, createdAtMs
+leadGuest, contactNumber, checkin, checkout, checkinTime
+nights, guests, extras, roomPrice, extrasPrice
+subtotal, taxes, totalPrice, total
+status, createdAt, updatedAt, createdAtMs
+cancellationReason, cancelledAt
+loyaltyPointsAwarded, loyaltyPointsEarned, loyaltyLockedAt
 ```
 
 Guests can create and read their own reservations. Admins can read and update
@@ -179,6 +227,18 @@ firebase deploy --only hosting
 firebase deploy --only firestore:rules
 ```
 
+### Development validation
+
+This repository is a static Firebase Hosting project and currently has no
+package manifest, type-checker, linter, unit-test runner, or production
+bundler. Use the Firebase Hosting emulator for development and validate
+changes with:
+
+```bash
+firebase emulators:start
+git diff --check
+```
+
 ## Security notes
 
 Firestore rules are the actual access-control boundary:
@@ -201,8 +261,8 @@ demonstration:
 
 - Room names, descriptions, photos, amenities, rates, and ratings are static
   JavaScript data rather than Firestore content.
-- A successful booking marks the room `Occupied`; it does not yet resolve
-  overlapping reservations by date range.
+- Availability is currently an inventory count per room document; date-range
+  overlap checks are not yet implemented.
 - Admin access uses an email allow-list rather than Firebase custom claims.
 - Payments, email confirmations, image uploads, and production-grade
   availability locking are not implemented.

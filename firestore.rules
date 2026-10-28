@@ -13,12 +13,32 @@ function isAdminEmail() {
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // Guest profile, preferences, loyalty balance, and vouchers.
+    match /users/{userId} {
+      allow read: if request.auth != null &&
+        (request.auth.uid == userId || isAdminEmail());
+      allow create: if request.auth != null && request.auth.uid == userId;
+      allow update: if request.auth != null && request.auth.uid == userId;
+    }
+
     // Room status (Available / Occupied / Cleaning).
     // Anyone (including signed-out guests browsing) can read live availability.
     // Only admin accounts can change it.
     match /rooms/{roomId} {
       allow read: if true;
-      allow write: if isAdminEmail();
+      allow create: if isAdminEmail() ||
+        (request.auth != null &&
+         request.resource.data.availabilityCount >= 0 &&
+         request.resource.data.status in ['Available', 'Occupied']);
+      allow delete: if isAdminEmail();
+      // Guests may only reserve or release one inventory unit. Admins retain
+      // full control over status and inventory.
+      allow update: if isAdminEmail() ||
+        (request.auth != null &&
+         request.resource.data.diff(resource.data).affectedKeys()
+           .hasOnly(['availabilityCount', 'status', 'updatedAt']) &&
+         (request.resource.data.availabilityCount == resource.data.availabilityCount - 1 ||
+          request.resource.data.availabilityCount == resource.data.availabilityCount + 1));
     }
 
     // Reservations.
